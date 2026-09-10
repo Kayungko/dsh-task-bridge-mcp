@@ -148,7 +148,82 @@ test/smoke.mjs   离线 smoke 测试（mock 桥）
 skills/dsh-task-bridge/SKILL.md   Codex 侧使用纪律（拉模型/策略闸/回执解读/错误码表）
 ```
 
-## 已知限制（未验证项）
+## dshq CLI
+
+`cli/dshq.mjs` 为 Codex 侧编排 CLI v0.1.0（零 npm 依赖 Node ESM，Node.js ≥18.17）。
+独立消费桥的六个 REST 端点，不修改 MCP 配置或宿主。PowerShell 当前进程可定义：
+
+```powershell
+function dshq { & node 'D:\git\DHS-Tool\bridge-mcp\cli\dshq.mjs' @args }
+dshq version
+dshq status
+dshq list --team task-bridge
+dshq reply 95a2abaf
+```
+
+| 命令 | 参数与用途 |
+|---|---|
+| status | 舰队总数、running、空闲但有待办、24h 活跃数；各组最多显示 5 条，--json 取完整已返回集合 |
+| list | `--team T --filter S --ungrouped --all`；默认隐藏 blank，--all 显示全部返回条目 |
+| find | `<子串>`，查询候选，不执行投递 |
+| progress | `<会话>`，状态/队列/todos/goal/recent；--json 保留原信封 |
+| reply | `<会话> --lines N`，只显示 assistant 尾部 N 条（默认 3） |
+| spawn | `<prompt> --title T --team M --cwd D --model P/M --watch --auto-retry`；选项均可省略 |
+| send | `<会话> <text> --steer --reference R`；wire 字段为 text，默认 queue |
+| watch | `<会话…> --mode all或any --until-idle --max-min M`；默认 all、10 分钟 |
+| models | 路线目录、default/pluginDefault；指定路线前先查真实 ID |
+| version | CLI 版本、GET models 可达性、token 来源类型（绝不显示值） |
+
+全局 `--json`、`--base <url>`、`--timeout <ms>`、`--help` 可放命令前后。
+token 优先级与 MCP 相同，每请求惰性重读；base 优先级为 `--base` > TASK_BRIDGE_URL > 默认。
+CLI 限制为无凭据的回环 HTTP(S) base，禁用重定向；所有输出统一掩盖已用 token 和 64hex 形态。
+不提供 token argv 选项，不启动包含 token 的子进程。
+
+会话三态：完整 `session-…` 直通；8 位短 ID 从 `list?limit=500` 匹配 shortId/ID；
+其余对 title/team 做忽略大小写的子串匹配。唯一命中采用并回显全 ID，多命中列候选退 3，
+零命中退 1 并提示 list；列表被截断时拒绝自动解析，先过滤 list 再用完整 ID。
+
+```powershell
+dshq find '总控'
+dshq progress 95a2abaf --json
+dshq spawn '只回复一句话后结束回合，不调用工具。' --title '探索｜编排探针' --team dshq-shakedown --cwd 'D:\git\DHS-Tool' --watch
+```
+
+`watch` 每次 wait 默认 45000ms（`--timeout` 可缩短，上限 45000ms），
+请求另留最多 5000ms 网络余量；`settled:false` 打印心跳并继续。
+`--until-idle` 是默认行为的显式同义选项。结束时 progress 拉各目标的最后一条 assistant 回复，
+`--mode any` 下其他目标可能仍在运行。`--max-min` 限制等待预算，最终 progress 快照请求
+可再占各自的 `--timeout` 时间；预算耗尽为本地 watch-timeout，退 1，附已读 progress。
+`spawn --watch` 保留完整派发回执（placement/workspace/modelSource/warning 等），再等并拉回复。
+调用方须核对落位及模型，空闲不能直接作为任务完成证据。
+
+`--json` stdout 恰好一个 JSON 对象，心跳/中途 spawn 回执/投递提示写 stderr：
+progress 为桥信封；reply 为 `{ok,sessionId,recent,notes}`；watch 为 wait 信封加
+`sessionIds,rounds,timedOut,progress`；spawn --watch 为 `{ok,spawn,watch}`。
+敏感输出脱敏仍适用于 JSON。exit 0 成功，1 本地参数/网络/协议/等待预算错误，
+2 桥八值错误，3 ID 歧义。错误输出含 code/error/advice 与桥补救字段。
+
+只有 `spawn --auto-retry` 对 policy-gated 按 retryAfterMs 等待，最多重试 3 次；
+spawn-depth-exceeded 不重试。rate-limited、queue-full、网络失败均不自动重发，
+先 progress/list 对账，避免重复投递或孤儿会话。
+
+**回信约定**：DSH 将【L2→L1】回信独立成段放在助手消息开头，全文 ≤200 字。
+reply 保留 `(+N chars)` 摘录截断标记，提示「请 DSH 重发短回信」，不猜测缺失内容。
+recent 为空会提示检查是否有转录，以及宿主是否已重启到 task-coordinator v0.24.1+。
+
+本机配套 skill：`C:\Users\admin\.agents\skills\dsh-orchestration\SKILL.md`（仓库外独立安装）。
+规格基线：上级 research/codex-side-toolkit-spec.md，提交 `0965cfe`。
+
+离线验收：
+
+```powershell
+node cli/test/smoke.mjs
+```
+
+mock HTTP 桥覆盖十命令、ID 三态、send.text、八值错误、token 三来源/轮换/脱敏、
+watch 收敛/预算耗尽、策略闸退避和 JSON/进程退出码；不接触真实 token 或真实 DSH 任务。
+
+## 已知限制（以下为原 MCP wrapper 的历史未验证项，非 dshq CLI 验收结论）
 
 1. **未与真桥实机联调**：REST 端点形状已按桥端 `D:\git\DHS-Tool\bridge` README
    （v0.1.0）的端点对照表逐项核对（wire 字段名、参数序列化、回执字段、
