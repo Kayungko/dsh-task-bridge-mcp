@@ -87,10 +87,10 @@ token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文�
 
 | 工具 | 桥端点 | 参数 | 回执关键字段 |
 |---|---|---|---|
-| `dsh_task_spawn` | POST `/v1/spawn` | `prompt`*（自包含 kickoff 指令）；`title`/`team`/`cwd`/`provider`/`model`/`reasoningEffort` 可选。**不暴露 `reportBack`（结构性关闭）** | `sessionId`、`workspace` `{id,title}\|null`、`placement`（五级）、`model`+`modelSource`（explicit/plugin-default/host-default）、`correlationId`、`depth`；失败分支 `model-select-failed`/`kickoff-rejected` 含孤儿 `sessionId` |
-| `dsh_task_send` | POST `/v1/send` | `sessionId`*、`message`*；`mode`（queue/steer）、`reference` 可选 | `messageId`、`queueDepth` `{nextTurn,nextStep}`、`placement`（next-step/next-turn）、`targetStatus` |
-| `dsh_task_progress` | GET `/v1/progress` | `sessionId`* | `live`、`agentState`、`queue`、`recent`（尾部摘要）、`todos`、`goal`、`seq` |
-| `dsh_task_wait` | GET `/v1/wait` | `sessionIds`*（单值或数组）；`mode`（all/any）、`timeoutMs`（默认 45000，**钳制 ≤50000**） | `settled`（false=正常心跳，续 call 即可）、`waitedMs`、`targets[]` |
+| `dsh_task_spawn` | POST `/v1/spawn` | `prompt`*（自包含 kickoff 指令）；`title`/`team`/`cwd`/`provider`/`model`/`reasoningEffort` 可选。**不暴露 `reportBack`（结构性关闭）** | `sessionId`、`workspace` `{id,title}\|null`、`placement`（五级）、`model`+`modelSource`（explicit/plugin-default/host-default）、`correlationId`、`depth`；失败 code=`upstream-error`（`upstreamCode=model-select-failed`/`kickoff-rejected` 时含孤儿 `sessionId`）/`policy-gated`/`bad-request` |
+| `dsh_task_send` | POST `/v1/send`（工具面 `message` → wire 字段 `text`） | `sessionId`*、`message`*；`mode`（queue/steer）、`reference` 可选 | `delivered`、`targetId`、`mode`、`messageId`、`queueDepth` `{nextTurn,nextStep}`、`placement`（next-step/next-turn）、`targetStatus`；失败 code=`rate-limited`/`queue-full`/`not-found`/`bad-request` |
+| `dsh_task_progress` | GET `/v1/progress` | `sessionId`* | `agentState`（idle/running/cold-idle）、`updatedAt`、`queue`、`recent`（尾部摘要）、`todos`、`goal`、`seq`、`inspectError` |
+| `dsh_task_wait` | GET `/v1/wait` | `sessionIds`*（单值或数组）；`mode`（all/any）、`timeoutMs`（默认 45000，**钳制 ≤50000**） | `settled`（false=正常心跳，续 call 即可）、`reason`、`waitedMs`、`count`、`targets[]` |
 | `dsh_task_list` | GET `/v1/list` | `filter`/`team`/`includeSubagents`/`ungrouped`/`limit` 全可选 | `tasks[]`、`truncated` |
 | `dsh_task_models` | GET `/v1/models` | 无 | `providers[]`、`default`、`pluginDefault`、`failedProviders` |
 
@@ -111,10 +111,13 @@ token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文�
 ### 错误信封
 
 桥应答 `{ok:false, code, error}` 一律转成 **MCP tool error**（`isError:true`），
-`code`+`error` 原样透传（附加字段如 `retryAfterMs`、孤儿 `sessionId` 一并透传），
-**绝不吞错**。wrapper 自身错误码：`token-missing` / `bridge-unreachable` /
-`bridge-timeout` / `bridge-http-error` / `bridge-invalid-response` / `invalid-params` /
-`internal-error`。完整处置表见 [`skills/dsh-task-bridge/SKILL.md`](skills/dsh-task-bridge/SKILL.md)。
+`code`+`error` 原样透传（信封附加字段如 `retryAfterMs`、`upstreamCode`、孤儿
+`sessionId` 一并透传），**绝不吞错**。桥端 `code` 为八值稳定枚举
+（`unauthorized`/`forbidden-body`/`bad-request`/`policy-gated`/`rate-limited`/
+`queue-full`/`not-found`/`upstream-error`，权威表见桥 README）。wrapper 自身错误码：
+`token-missing` / `bridge-unreachable` / `bridge-timeout` / `bridge-http-error` /
+`bridge-invalid-response` / `invalid-params` / `internal-error`。
+完整处置表见 [`skills/dsh-task-bridge/SKILL.md`](skills/dsh-task-bridge/SKILL.md)。
 
 ## 安全注意事项
 
@@ -132,7 +135,7 @@ token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文�
 
 ```powershell
 npm run check   # node --check 全部源文件
-npm test        # 离线 smoke：node:http mock REST server，9 个用例全绿，不依赖真桥
+npm test        # 离线 smoke：node:http mock REST server，10 个用例全绿，不依赖真桥
 ```
 
 目录结构：
@@ -147,10 +150,10 @@ skills/dsh-task-bridge/SKILL.md   Codex 侧使用纪律（拉模型/策略闸/�
 
 ## 已知限制（未验证项）
 
-1. **未与真桥联调**：REST 端点形状按蓝图 §0.2/§3 与桥插件共用契约实现
-   （`/v1/spawn|send|progress|wait|list|models`，GET/POST、query/body 参数名对齐
-   task-coordinator ops 语义）；真桥（`D:\git\DHS-Tool\bridge`，并行开发）bring-up 时
-   需实机核对参数名并补集成测试。
+1. **未与真桥实机联调**：REST 端点形状已按桥端 `D:\git\DHS-Tool\bridge` README
+   （v0.1.0）的端点对照表逐项核对（wire 字段名、参数序列化、回执字段、
+   错误码枚举），并同步了 send 的 `message`→`text` wire 映射；但端到端实机
+   联调（真实宿主 webserver + 真实 token）留待 bring-up 阶段。
 2. **Codex 实机 MCP 挂载未验证**：`config.toml` 字段实际生效行为、`instructions`
    采用度按官方文档实现（蓝图 §4.2），留待 bring-up 用 `codex mcp list` / TUI `/mcp` 验证。
 3. `dsh_task_cancel` 未提供（桥第二批端点）。

@@ -99,7 +99,7 @@ test('mock 桥 + 全工具打通：请求形状、token 头、回执透传', asy
   const baseUrl = await mock.start();
   t.after(() => mock.close());
 
-  // 典型 ok:true 回执（字段形状对齐蓝图 §3.3）
+  // 典型 ok:true 回执（字段形状对齐桥端 README 端点对照表）
   mock.on('POST', '/v1/spawn', 200, {
     ok: true, sessionId: 'sess-spawn-1', shortId: '0909', title: '0909｜功能｜测试',
     team: 'bridge-mvp', cwd: 'D:/x', workspace: { id: 'w1', title: 'W1' },
@@ -107,11 +107,12 @@ test('mock 桥 + 全工具打通：请求形状、token 头、回执透传', asy
     started: true, correlationId: 'task-coord-abc', depth: 1,
   });
   mock.on('POST', '/v1/send', 200, {
-    ok: true, messageId: 'msg-9', queueDepth: { nextTurn: 1, nextStep: 0 },
-    placement: 'next-turn', targetStatus: 'running',
+    ok: true, delivered: true, targetId: 'sess-1', mode: 'steer', messageId: 'msg-9',
+    queueDepth: { nextTurn: 1, nextStep: 0 }, placement: 'next-step', targetStatus: 'running',
   });
   mock.on('GET', '/v1/progress', 200, {
-    ok: true, live: true, agentState: 'live-idle', queue: 0, recent: ['r1'], todos: [], seq: 42,
+    ok: true, agentState: 'idle', updatedAt: '2026-09-10T00:00:00Z', queue: 0,
+    recent: ['r1'], todos: [], seq: 42,
   });
   mock.on('GET', '/v1/wait', 200, {
     ok: true, settled: true, waitedMs: 120, targets: [{ sessionId: 's', agentState: 'cold-idle' }],
@@ -140,19 +141,21 @@ test('mock 桥 + 全工具打通：请求形状、token 头、回执透传', asy
   assert.equal(spawnReq.body.reportBack, undefined, 'spawn 请求不得携带 reportBack（结构性关闭）');
   assert.equal(spawnReq.tokenHeader, FAKE_TOKEN, 'token 头必须注入');
 
-  // send：回执含 queueDepth
+  // send：wire 契约（工具面 message → 桥端 text）+ 回执含 queueDepth
   const send = await callTool('dsh_task_send', { sessionId: 'sess-1', message: '继续', mode: 'steer' }, ctx);
   const sendBody = JSON.parse(toolText(send));
   assert.equal(sendBody.messageId, 'msg-9');
   assert.deepEqual(sendBody.queueDepth, { nextTurn: 1, nextStep: 0 });
   const sendReq = mock.seen.find((r) => r.pathname === '/v1/send');
+  assert.equal(sendReq.body.text, '继续', 'wire 字段必须是 text（桥端契约）');
+  assert.equal(sendReq.body.message, undefined, 'wire 不得携带 message 字段');
   assert.equal(sendReq.body.mode, 'steer');
   assert.equal(sendReq.tokenHeader, FAKE_TOKEN);
 
   // progress
   const prog = await callTool('dsh_task_progress', { sessionId: 'sess-1' }, ctx);
   const progBody = JSON.parse(toolText(prog));
-  assert.equal(progBody.agentState, 'live-idle');
+  assert.equal(progBody.agentState, 'idle', 'agentState 为桥端三值枚举（idle/running/cold-idle）');
   assert.equal(mock.seen.find((r) => r.pathname === '/v1/progress').query.sessionId, 'sess-1');
 
   // wait：单 id + mode
@@ -190,7 +193,8 @@ test('ok:false → MCP tool error：code+error 透传，绝不吞错', async (t)
     ok: false, code: 'rate-limited', error: 'rate limited: retry after 2000ms', retryAfterMs: 2000,
   });
   mock.on('POST', '/v1/spawn', 200, {
-    ok: false, code: 'kickoff-rejected', error: 'kickoff rejected: prompt empty', sessionId: 'orphan-sess-1',
+    ok: false, code: 'upstream-error', error: 'kickoff rejected: prompt empty',
+    upstreamCode: 'kickoff-rejected', sessionId: 'orphan-sess-1',
   });
 
   const client = new BridgeClient({ baseUrl, env: fakeEnv() });
@@ -210,7 +214,8 @@ test('ok:false → MCP tool error：code+error 透传，绝不吞错', async (t)
   const spawn = await callTool('dsh_task_spawn', { prompt: 'p' }, ctx);
   assert.equal(spawn.isError, true);
   const spawnErr = JSON.parse(toolText(spawn));
-  assert.equal(spawnErr.code, 'kickoff-rejected');
+  assert.equal(spawnErr.code, 'upstream-error', '桥端稳定枚举 code 透传');
+  assert.equal(spawnErr.upstreamCode, 'kickoff-rejected', 'upstreamCode（原始 ops 码）透传');
   assert.equal(spawnErr.sessionId, 'orphan-sess-1', '孤儿 sessionId 必须透传供补救');
 });
 
@@ -355,9 +360,9 @@ test('JSON-RPC 协议分支：initialize / tools/list / notifications / ping / �
   );
   assert.equal(init.result.protocolVersion, '2025-06-18');
   assert.equal(init.result.serverInfo.name, 'dsh-task-bridge-mcp');
-  assert.equal(init.result.serverInfo.version, '0.1.0');
+  assert.equal(init.result.serverInfo.version, '0.1.1');
   assert.ok(init.result.instructions.length > 200, 'instructions 必须载拉模型纪律');
-  for (const kw of ['拉', '串行', 'confirmation-required', 'settled:false', 'queueDepth', 'progress', 'dsh_task_models']) {
+  for (const kw of ['拉', '串行', 'policy-gated', 'retryAfterMs', 'settled:false', 'queueDepth', 'progress', 'dsh_task_models']) {
     assert.ok(INSTRUCTIONS.includes(kw), `instructions 须覆盖纪律关键词：${kw}`);
   }
 

@@ -3,6 +3,38 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.1] - 2026-09-10
+
+互操作修正：对齐桥端 dsh-plugin-task-bridge v0.1.0 已落地的实现
+（权威端点对照表与错误码表见 `D:\git\DHS-Tool\bridge\README.md`）。
+
+### 修正
+
+- **send wire 字段**：桥端 `/v1/send` 正文字段为 `text`；工具面参数名保持
+  `message`（对 Codex 语义更自然），`src/tools.mjs` 组包时映射为 `text`。
+- **策略闸语义**：滚动窗口 60s/10 次（可配），超限返回 429 `policy-gated`
+  （附 `retryAfterMs`）——修正 v0.1.0 误写的「>2 次/confirmation-required」；
+  处置纪律改为「读 retryAfterMs 等待后重试，串行派发天然低触发」。
+  同步 `instructions`、README、SKILL.md 三处。
+- **错误码表对齐桥端八值稳定枚举**：`unauthorized`(401/403) /
+  `forbidden-body`(400/413/415) / `bad-request`(400/405) / `policy-gated`(429) /
+  `rate-limited`(429) / `queue-full`(429) / `not-found`(404) /
+  `upstream-error`(500/502/503)；上游 ops 码经 `upstreamCode` 透传
+  （如 `model-select-failed`/`kickoff-rejected`，孤儿 `sessionId` 一并透传）。
+  SKILL.md 桥层处置表整表重写。
+- **progress 回执字段对齐**：无 `live` 字段；`agentState` 为三值枚举
+  （idle/running/cold-idle），补 `updatedAt`/`inspectError`。
+- **spawn/send/wait 工具 description**：失败 code 改为桥端枚举表述；
+  send 回执补 `delivered`/`targetId`/`mode`；wait 回执补 `reason`/`count`
+  与 targets 元素形状；list 的 `limit` 补 1..500 范围。
+
+### 测试
+
+- smoke 断言同步：send 请求体 `text` 字段（且无 `message`）、progress mock
+  回执桥形状（agentState 三值）、spawn 失败 mock 桥信封
+  （code=`upstream-error`+`upstreamCode`+孤儿 sessionId 透传）、
+  instructions 关键词 `policy-gated`/`retryAfterMs`。
+
 ## [0.1.0] - 2026-09-10
 
 首个版本：Codex 侧 MCP stdio wrapper，把 dsh-plugin-task-bridge 的 REST 端点

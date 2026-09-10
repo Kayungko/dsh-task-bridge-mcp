@@ -1,6 +1,6 @@
 {
   "name": "dsh-task-bridge-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex-side MCP stdio wrapper exposing dsh-plugin-task-bridge REST endpoints as MCP tools",
   "type": "module",
   "bin": {

@@ -43,10 +43,10 @@ function normalizeSessionIds(args) {
 
 export const INSTRUCTIONS = [
   'DSH task-bridge 拉模型（pull-model）操作纪律：',
-  '1) 派发用 dsh_task_spawn 串行进行——桥侧策略闸限制滚动 60s 窗口内最多 2 次 spawn，超出返回 429 confirmation-required；收到即停，等待人类处理，绝不用重试绕过。spawn 回执必读 workspace/placement/modelSource：ungrouped/worktree 落位（含 warning）须先补救或确认接受；模型路线不符预期立即停止并纠正。',
+  '1) 派发用 dsh_task_spawn 串行进行——桥侧策略闸限制滚动 60s 窗口内最多 10 次 spawn，超限返回 429 policy-gated（附 retryAfterMs）：读 retryAfterMs 等待后再重试，串行派发天然低触发。spawn 回执必读 workspace/placement/modelSource：ungrouped/worktree 落位（含 warning）须先补救或确认接受；模型路线不符预期立即停止并纠正。',
   '2) 反馈一律拉取（reportBack 已结构性关闭）：用 dsh_task_wait 分段等待（timeoutMs 默认 45000、上限 50000；settled:false 是正常心跳而非错误，续 call 即可），配合 dsh_task_progress 读 recent 尾部/todos/goal/agentState 判断进展。禁止高频轮询轰炸：wait 长轮询本身就是等待，progress 仅在 wait 返回 settled 或需要决策时读取。',
   '3) 纠偏用 dsh_task_send：目标运行中用 mode=steer（下一生效步骤生效）；空闲目标或追加上下文用默认 queue。回执 queueDepth.nextTurn>=2 表示该消息约 2 轮后才被读——改用 steer 或先等一轮，避免晚一步白干一步。',
-  '4) 工具返回 isError:true 时读 code 与 error 字段并按 skills/dsh-task-bridge/SKILL.md 错误码处置表行动。spawn 失败若回执含孤儿 sessionId（model-select-failed/kickoff-rejected），该会话已存在：用 dsh_task_send 补发开场消息，或放弃并让总控处置。',
+  '4) 工具返回 isError:true 时读 code 与 error 字段并按 skills/dsh-task-bridge/SKILL.md 错误码处置表行动。spawn 返回 upstream-error 且信封含孤儿 sessionId（upstreamCode 为 model-select-failed/kickoff-rejected）时该会话已存在：用 dsh_task_send 补发开场消息，或放弃并让总控处置。',
   '5) 派发前不确定模型路线就先调 dsh_task_models 查合法 provider/model id——绝不猜 id。',
   '6) 换会话后先用 dsh_task_list（可带 team 过滤）重建指挥上下文。',
 ].join('\n');
@@ -65,8 +65,9 @@ export const TOOLS = [
       '成功回执字段：sessionId、shortId、title、team、cwd、workspace（{id,title} 或 null）、' +
       'placement（exact-match/caller-inherited/ancestor-normalized/ungrouped-worktree/ungrouped 五级，后两级带 warning 需处置）、' +
       'model 与 modelSource（explicit/plugin-default/host-default 三级来源）、started、correlationId、depth。' +
-      '失败（isError:true）时 code 可能是 model-select-failed / kickoff-rejected（两者回执含已创建的孤儿 sessionId，可补救）/' +
-      'spawn-depth-exceeded；ok:false 的 error 字段透传桥端原文。',
+      '失败（isError:true）时 code 为桥端稳定枚举：upstream-error（502，upstreamCode=model-select-failed/kickoff-rejected 时' +
+      '信封含已创建的孤儿 sessionId，可补救）、policy-gated（429，spawn 滚动窗口超限，附 retryAfterMs）、bad-request（400）；' +
+      'error 字段透传桥端原文。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -96,12 +97,13 @@ export const TOOLS = [
       'message（必填，消息正文：纠偏指令、补充上下文或交接信息）；' +
       'mode（可选：queue=下一轮开始时投递（默认，目标运行中排队/空闲即开新轮）；steer=运行中目标在当前轮的下一生效步骤立即生效——用于停止/纠偏/冲突警告等需要立刻改变下一步的场景）；' +
       'reference（可选，引用早前回执的 messageId 或 spawn 的 correlationId，用于可追溯的纠偏链）。' +
-      '成功回执字段：messageId（可被后续 send 的 reference 引用）、' +
+      '成功回执字段：delivered（是否已投递）、targetId、mode（实际投递模式）、messageId（可被后续 send 的 reference 引用）、' +
       'queueDepth（{nextTurn,nextStep}，投递后口径含本条；nextTurn>=2 意味着约 2 轮后才被读——考虑改 steer）、' +
       'placement（next-step=mid-run steering 已生效 / next-turn=已排队）、targetStatus（running/idle）、' +
       'note（冷目标投递的注意事项，如有）。' +
-      '失败 code 常见：rate-limited（429，附 retryAfterMs，等够时间再发）、queue-full（429，队列已满先等消费）、' +
-      'target-busy（409）、target-not-found / target-vanished（404，id 错误或会话已结束）。桥不自动重试——重试节奏由调用方掌握。',
+      '失败 code 常见：rate-limited（429，附 retryAfterMs，等够时间再发；含上游 target-busy）、queue-full（429，队列已满先等消费）、' +
+      'not-found（404，upstreamCode=target-not-found/target-vanished：id 错误或会话已结束）、bad-request（400）。' +
+      '桥不自动重试——重试节奏由调用方掌握。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -113,9 +115,11 @@ export const TOOLS = [
       required: ['sessionId', 'message'],
     },
     async handler(client, args) {
+      // wire 契约：桥端 /v1/send 的正文字段是 text（工具面参数名保持 message，
+      // 语义对 Codex 更自然）；此处做工具面→wire 的映射。
       const body = {
         sessionId: requireString(args, 'sessionId'),
-        message: requireString(args, 'message'),
+        text: requireString(args, 'message'),
       };
       const mode = optionalString(args, 'mode');
       if (mode) body.mode = mode;
@@ -128,9 +132,9 @@ export const TOOLS = [
     name: 'dsh_task_progress',
     description:
       '读取一个任务会话的当前进度快照（GET /v1/progress），不打扰目标。参数：sessionId（必填）。' +
-      '回执字段：live（true=活动会话 / false=冷会话，冷≠无待办）、agentState（如 live-idle/cold-idle 等状态口径）、' +
-      'queue（排队消息深度）、recent（最近消息尾部摘要，条数与字符数由桥配置限制）、todos（任务清单状态）、' +
-      'goal（目标进度，如有）、seq（序列号，可用于判断是否有新事件）。' +
+      '回执字段：agentState（idle/running/cold-idle 三值枚举；cold-idle=冷会话——冷≠无待办，结果用 todos/goal 确认）、' +
+      'updatedAt（快照时间）、queue（排队消息）、recent（最近消息尾部摘要，条数与字符数由桥配置限制）、todos（任务清单状态）、' +
+      'goal（目标进度，如有）、seq（序列号，可用于判断是否有新事件）、inspectError（冷会话检查失败原因，如有）。' +
       '用于 spawn 后检查 kickoff 是否被消费、wait 空闲后确认收尾状态、以及决策前读取上下文。只读操作，可安全穿插。',
     inputSchema: {
       type: 'object',
@@ -152,7 +156,7 @@ export const TOOLS = [
       'timeoutMs（可选，默认 45000，硬上限 50000——超过会被钳制；受 Codex 工具超时 60s 约束，勿建议更大值）。' +
       '回执：settled=true 表示目标已空闲（冷目标返回 settled=true，冷≠无待办，用 dsh_task_progress 确认）；' +
       'settled=false 表示本轮等待超时但目标仍在运行——这是正常心跳语义而非错误，直接再次调用本工具继续等待；' +
-      'waitedMs（实际等待毫秒）；targets[]（各目标状态）。' +
+      'waitedMs（实际等待毫秒）、count（目标数）、targets[]（各目标 {sessionId,idle,agentState}）、reason（说明文案）。' +
       '纪律：spawn 后用本工具分段等待而非轮询轰炸；wait 返回 settled 后再读 dsh_task_progress 获取结果。',
     inputSchema: {
       type: 'object',
@@ -189,7 +193,7 @@ export const TOOLS = [
       '列出协调可见的顶层任务会话（GET /v1/list），用于换会话后重建指挥上下文。' +
       '参数全部可选：filter（对 session id/标题/cwd 的不区分大小写子串过滤）；team（只列某编组）；' +
       'includeSubagents（默认 false，true 时含子代理来源会话）；ungrouped（默认 false，true 时只列未入工作区组的会话，配合落位审计）；' +
-      'limit（默认 50，最新在前）。' +
+      'limit（1..500，默认 50，最新在前）。' +
       '回执：tasks[]（每行含 sessionId/标题/运行状态/todo 与 goal 进度摘要等投影字段）与 truncated（结果被截断标记）。' +
       '只读操作。',
     inputSchema: {
