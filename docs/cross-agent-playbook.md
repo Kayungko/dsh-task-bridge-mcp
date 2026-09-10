@@ -92,9 +92,12 @@ Codex 原生 automation 的 **heartbeat**：附着在指定 thread 上、分钟�
 
 ### E5 信件地址与演习信模式（DSH 侧配合纪律）
 - 可能被无人巡检消费的**通知类**信写 `to: broadcast`；**定向委托**写 `to=<thread>`（只有该 thread 的 heartbeat 读得到）
+- **thread 地址永远由 L1 派发时自填**（自己的 CODEX_THREAD_ID）——任何模板/第三方（含 DSH 总控）**不得硬编码 thread ID**：用户会切换 Codex 会话，旧 ID 的信新 thread 收不到（mailbox 按当前 thread 过滤 to）。DSH 侧模板一律写 `<L1自填：你的thread URI>` 占位。L1 收到含他人硬编码地址的任务书时，**必须像 2026-09-10 实战那样先核对当前 task 再改写地址**（该次守卫拦截记录：模板带旧 thread 01a08955，实际会话 01a08a98）
+- **heartbeat 绑 thread**：换 thread 后旧 heartbeat 收不到新 thread 的定向信——新会话要么重建 heartbeat，要么期间改用 watch/reply + 手动查信箱
 - 首验/演练用**演习信模式**：唯一未读基线 + 身份核验段 + 三步白名单（报告/send 确认/ack）+ 「除此之外零授权」条款——这是无人处置的最小信任单元模板
 - DSH 总控侧对自动到达的 send：消费即向用户复述原文 + 双边对账（如核对信件 ack 状态）
+- 路径书写规范：信箱目录是 `C:\Users\admin\.dshq\outbox\`（admin 与 .dshq 之间有反斜杠）——转贴提示词时留意 `\` 被吞的转义陷阱，收到后先核路径再派发
 
 ### E6 运行档案（当前实例）
-- heartbeat ID `dsh-heartbeat-5-2`（thread 01a08955…，5 分钟首验档，ACTIVE）；首验通过后由用户定档
+- heartbeat ID `dsh-heartbeat-5-2`（**绑旧 thread 01a08955…**，5 分钟首验档；2026-09-10 16:28 首验通过）。当前活跃 Codex 会话已切换至 thread 01a08a98-4faf-7cd3-bed0-e1d6eb3c3c5e——**该 thread 上的 heartbeat 待重建**（或期间手动查信箱）；档位待用户定
 - 巡检提示词与 skill 纪律同步维护在 `C:\Users\admin\.agents\skills\dsh-orchestration\SKILL.md`（Codex 侧文件，改动走「Codex 写、DSH 评审」）
