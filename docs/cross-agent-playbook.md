@@ -1,6 +1,6 @@
 # 跨端编排速查表（Codex ⇄ DSH 双侧提示词手册）
 
-> 落盘：2026-09-10，DSH 总控编写。适用：dshq v0.3.0 / bridge v0.2.0 / task-coordinator v0.25.0。
+> 落盘：2026-09-10，DSH 总控编写（同日按 Codex 实现核对修订：版本口径/A7 台账语义/C2 双闸门区分/D 表多因化）。适用：bridge-mcp 仓 tag v0.3.0（**CLI 自报版本为 dshq 0.2.0，两者是不同口径**——package/tag 是发布号，CLI banner 是自报号，不据标签假定行为）/ bridge v0.2.0 / task-coordinator v0.25.0。
 > 定位：给**人**看的话术卡——每句都是自然语言，skill（dsh-orchestration / task-coordination）负责翻译成命令。
 > 机制细节权威：`bridge/README.md`（端点/错误码）、`bridge-mcp/README.md`（CLI/MCP）、`plugin/skills/task-coordination/SKILL.md`（投递语义）、`research/dshq-ledger-mailbox-spec.md`（台账/别名/信箱/externalRef 契约）。
 
@@ -31,7 +31,7 @@ Codex 会话消费（拉模型；Codex 无入站端口，物理上限）
 | A4 | 纠偏插队 | 给 <别名> 发条 steer：<纠偏内容>，别等新轮次 |
 | A5 | 等结果收回信 | 等 <别名> 空闲，把它的回复拉出来（提醒它守回信约定：置顶、200 字内） |
 | A6 | 查信箱 | 查信箱，有信就读给我听并 ack，按信里说的执行 |
-| A7 | 波次盘点 | 我这个 thread 在 DSH 里派过哪些会话？按波次列出来，带状态和 ref |
+| A7 | 波次盘点 | 本机 dshq 台账里记过哪些 DSH 会话？按波次列出来带状态和 ref（注意：waves 台账是**用户级**共享的，不按 thread 自动隔离——多 thread 环境用 ref 前缀 `<thread短id>:` 区分归属） |
 | A8 | 卡住处置 | <别名> 好像卡了：看排队深度和最近动态，消息堆积就先等消化，真停摆告诉我，别硬灌 |
 | A9 | 跨端指挥 | 给总控发消息：请它<动作>，口径按老规矩 |
 | A10 | 清理 | DSH 里 team 是 <名> 的探针会话列出来，确认空闲后请总控清理 |
@@ -48,20 +48,21 @@ Codex 会话消费（拉模型；Codex 无入站端口，物理上限）
 ## C. 双侧通用纪律（skill 已固化，人也要知道）
 
 1. **等待用 watch/wait 分段**（45–50s/段），settled=false 是正常心跳不是失败；禁高频轮询
-2. **投递语义**：queue=下一轮消费（每轮恰 1 条）；steer=步边界插队但延长对方回合；深度 ≥ 队列上限会拒（queue-full/policy-gated，读 retryAfterMs 退避）
+2. **投递语义**：queue=下一轮消费（每轮恰 1 条）；steer=步边界插队但延长对方回合。**两个 429 是两回事**：`queue-full`=目标会话消息积压（无 retryAfterMs，用 watch 等消化或改 steer）；`policy-gated`=桥侧派发速率闸（60s/10 次，读 retryAfterMs 退避重试）
 3. **冷 ≠ 无待办**：对方会话不在线不代表消息丢了，排队消息会在下次唤醒时消费
 4. **回信约定**：跨端回信一律【L2→L1】/【L1→L2】标记 + 置顶 + ≤200 字（躲 excerpt 截断）；长内容走信箱
-5. **reportBack 对桥结构性关闭**：Codex 派的 DSH 会话不会自动回报——反馈靠 watch+reply 拉
-6. **诚实纪律**：未验证的项明说未验证（两端今天各示范过一次：Codex 的 externalRef 挂起声明、DSH 的 recent 缺陷自曝）
+5. **信件地址纪律**：定向信 `to=<thread>` 只能由该 thread 读到——**计划任务/无人巡检的 codex exec 默认开新 thread**，收不到定向信；可能被巡检消费的通知类信件写 `to: broadcast`
+6. **reportBack 对桥结构性关闭**：Codex 派的 DSH 会话不会自动回报——反馈靠 watch+reply 拉
+7. **诚实纪律**：未验证的项明说未验证（两端今天各示范过一次：Codex 的 externalRef 挂起声明、DSH 的 recent 缺陷自曝）
 
 ## D. 故障速查
 
 | 症状 | 第一反应 |
 |---|---|
 | 桥 401 | token 文件被轮换过？`dshq version` 看 token 来源 |
-| 桥 connection refused | DSH Desktop 没在跑（桥寄生宿主 webserver） |
-| spawn 429 policy-gated | 60 秒内派太多，读 retryAfterMs 等 |
-| send 429 queue-full | 目标消化不动，watch 它或改 steer |
-| reply 拉到空 recent | 宿主版本 < v0.24.1（recent 恒空缺陷），升级重启 |
+| 桥 connection refused | DSH Desktop 没在跑（桥寄生宿主 webserver）**或 base URL 不对**（TASK_BRIDGE_URL 覆盖错了/--base 传错） |
+| spawn 429 policy-gated | 桥侧派发速率闸（60s/10 次），读 retryAfterMs 等 |
+| send 429 queue-full | 目标会话消息积压（与 policy-gated 不同闸门、无 retryAfterMs）：watch 它消化或改 steer |
+| reply 拉到空 recent | 多因排查：①宿主 < v0.24.1（recent 恒空缺陷，升级重启）②转录窗口截断（对方会话先点「载入更早记录」）③对方确实还没说话（watch 后重拉） |
 | reply 拉到的话被 (+N chars) 截断 | 对方没守回信约定——让它重发置顶短版 |
-| 信箱没信 | DSH 侧还没写；或看错目录（C:\Users\admin\.dshq\outbox\） |
+| 信箱没信 | ①DSH 侧还没写 ②信的 to= 是别的 thread（定向信只有该 thread 能收，巡检场景要 broadcast）③已被 ack（--all 看全部）④目录看错（C:\Users\admin\.dshq\outbox\） |
