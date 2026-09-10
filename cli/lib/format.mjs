@@ -2,9 +2,11 @@ import { shortId } from './resolve.mjs';
 
 const cell = value => String(value ?? '—').replace(/\s+/g, ' ');
 export function table(tasks) {
-  return ['shortId | title | team | status | todos | sessionId', ...tasks.map(t =>
+  const hasRef = tasks.some(t => t.externalRef || t.ref);
+  return ['shortId | title | team | status | todos | sessionId' + (hasRef ? ' | ref' : ''), ...tasks.map(t =>
     [shortId(t), t.title, t.team, t.status ?? t.agentState, typeof t.todos === 'object'
-      && t.todos !== null ? JSON.stringify(t.todos) : t.todos, t.sessionId].map(cell).join(' | '))].join('\n');
+      && t.todos !== null ? JSON.stringify(t.todos) : t.todos, t.sessionId,
+    ...(hasRef ? [t.externalRef ?? t.ref ?? ''] : [])].map(cell).join(' | '))].join('\n');
 }
 
 export function replyNotes(recent, messages) {

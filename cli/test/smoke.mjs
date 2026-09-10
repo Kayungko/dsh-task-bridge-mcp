@@ -9,6 +9,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { run } from '../lib/run.mjs';
 import { Client } from '../lib/client.mjs';
+import { mailboxSmoke } from './mailbox-smoke.mjs';
 
 const scratchParent = resolve(process.env.DSHQ_TEST_TMPDIR ?? tmpdir());
 await mkdir(scratchParent, { recursive: true });
@@ -86,7 +87,8 @@ async function invoke(args, options = {}) {
   return { code, stdout, stderr, data: args.includes('--json') ? JSON.parse(stdout) : undefined };
 }
 async function child(args) {
-  const childEnv = { ...process.env, ...env, TASK_BRIDGE_TOKEN_FILE: join(scratch, 'unused') };
+  const childEnv = { ...process.env, ...env, USERPROFILE: scratch, HOME: scratch,
+    TASK_BRIDGE_TOKEN_FILE: join(scratch, 'unused') };
   const processChild = spawn(process.execPath, [cli, ...args], { env: childEnv, windowsHide: true });
   let stdout = '', stderr = '';
   processChild.stdout.on('data', b => { stdout += b; });
@@ -272,6 +274,8 @@ try {
     assert.equal((await invoke(['version', '--base', `http://127.0.0.1:${port}`, '--json'])).data.code, 'bridge-unreachable');
     assert.equal((await invoke(['version', '--base', 'http://example.com', '--json'])).code, 1);
   });
+  await mailboxSmoke({ scratch, check, invoke, requests: () => requests, setResponder: value => { responder = value; },
+    defaults, id, id2, base, fake });
   console.log(`PASS ${passed} offline smoke checks`);
 } finally {
   server.closeAllConnections();

@@ -12,7 +12,7 @@ export function matches(tasks, query) {
   return tasks.filter(t => [t.title, t.team].some(v => v?.toLowerCase().includes(needle)));
 }
 
-export function resolver(client) {
+export function resolver(client, { store, note = () => {} } = {}) {
   let listing;
   async function candidates(query) {
     listing ??= client.request('/v1/list', { query: { limit: 500 } });
@@ -27,6 +27,11 @@ export function resolver(client) {
   return {
     candidates,
     async resolve(query) {
+      const aliases = store ? await store.aliases() : {};
+      if (Object.hasOwn(aliases, query)) {
+        note(`${query} → ${aliases[query]}`);
+        return aliases[query];
+      }
       if (/^session-\S+$/.test(query)) return query;
       const found = await candidates(query);
       if (found.length > 1) throw new CliError('ambiguous-session', '会话匹配不唯一。', {
