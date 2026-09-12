@@ -12,6 +12,8 @@ Codex CLI ──MCP stdio(JSON-RPC)──> dsh-task-bridge-mcp ──HTTP(fetch)
 
 当前源码新增能力查询、MCP/CLI 统一传输及增量反馈，见 [Codex 接入增量契约](docs/codex-integration.md)。运行状态以 capabilities 回执为准。
 
+长时间监控可用 `dshq monitor run/read/ack/status/stop`：本地静默检查，按 Codex 任务隔离游标与摘要，不调用模型。用法和边界见 [本地静默监控器](docs/local-monitor.md)。
+
 ## SDK 选型说明：手写 JSON-RPC，不用 @modelcontextprotocol/sdk
 
 按蓝图 §4 结论二选一，本项目选手写 JSON-RPC 2.0，理由：

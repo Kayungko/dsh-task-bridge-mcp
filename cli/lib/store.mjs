@@ -92,9 +92,16 @@ export class Store {
       file = await this.io.open(temp, 'wx', 0o600);
       await file.writeFile(content, 'utf8');
       await file.sync(); await file.close(); file = null;
-      await this.io.rename(temp, path);
-    } catch {
-      throw localError('原子写入未完成；原文件保留，不得据此重复派发。');
+      for (let attempt = 0; ; attempt++) {
+        try { await this.io.rename(temp, path); break; }
+        catch (error) {
+          if (attempt >= 3 || !['EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+          await sleep(40 * (attempt + 1));
+        }
+      }
+    } catch (error) {
+      throw localError('原子写入未完成；原文件保留，不得据此重复派发。',
+        /^[A-Z0-9_]+$/.test(error?.code ?? '') ? { ioCode: error.code } : {});
     } finally {
       if (file) await file.close();
       await this.io.unlink(temp).catch(e => { if (e.code !== 'ENOENT') throw localError('临时文件清理失败。'); });

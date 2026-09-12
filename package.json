@@ -10,7 +10,7 @@
     "node": ">=18.17"
   },
   "scripts": {
-    "check": "node --check src/contract.mjs && node --check src/transport.mjs && node --check src/server.mjs && node --check src/client.mjs && node --check src/tools.mjs",
+    "check": "node --check cli/lib/monitor.mjs && node --check cli/lib/run.mjs && node --check src/contract.mjs && node --check src/transport.mjs && node --check src/server.mjs && node --check src/client.mjs && node --check src/tools.mjs",
     "test": "node --test test/*.mjs cli/test/smoke.mjs"
   },
   "keywords": [

@@ -1,3 +1,4 @@
+import { Monitor } from './monitor.mjs';
 import { normalizeExternalRef } from '../../src/contract.mjs';
 import { parseArgs } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -10,6 +11,7 @@ import { Mailbox, mailTable } from './mailbox.mjs';
 
 export const VERSION = '0.2.0';
 const OPTIONS = {
+  owner: 'string', 'interval-sec': 'string', 'stale-min': 'string', once: 'boolean', limit: 'string',
   json: 'boolean', base: 'string', timeout: 'string', help: 'boolean', team: 'string',
   filter: 'string', ungrouped: 'boolean', all: 'boolean', lines: 'string', title: 'string',
   cwd: 'string', model: 'string', watch: 'boolean', 'auto-retry': 'boolean', steer: 'boolean',
@@ -17,6 +19,7 @@ const OPTIONS = {
   'no-ledger': 'boolean', ref: 'string', cursor: 'string', 'message-id': 'string', 'body-file': 'string',
 };
 const ALLOWED = {
+  monitor: ['owner', 'interval-sec', 'stale-min', 'once', 'max-min', 'limit'],
   status: [], list: ['team', 'filter', 'ungrouped', 'all', 'ref'], find: [], progress: ['cursor', 'message-id'], reply: ['lines'],
   spawn: ['title', 'team', 'cwd', 'model', 'watch', 'auto-retry', 'no-ledger', 'ref'], send: ['steer', 'reference'],
   watch: ['mode', 'until-idle', 'max-min'], models: [], version: [], capabilities: [],
@@ -33,6 +36,10 @@ reply <会话> [--lines N]
 spawn <prompt> [--title T] [--team M] [--cwd D] [--model P/M] [--watch] [--auto-retry] [--no-ledger] [--ref 标签]
 send <会话> <text> [--steer] [--reference R]
 watch <会话…> [--mode all|any] [--until-idle] [--max-min M]
+monitor run <名称> [会话…] [--once] [--interval-sec 30] [--stale-min 15] [--max-min 60]
+monitor read <名称> [--limit 20] / monitor ack <名称> <摘要ID…>
+monitor status <名称> / monitor stop <名称>（只停本地监控）
+monitor 命令按 CODEX_THREAD_ID 隔离；独立进程可显式 --owner <已确认任务ID>。
 models
 version / capabilities [--json]
 waves [--team T]
@@ -47,7 +54,7 @@ mailbox send <收件人> <主题> [--body-file F]
 mailbox read 不自动 ack；读完核验身份后 ack。信箱变化后重新 list，优先用文件名。
 mailbox send 未给 --body-file 时正文为空，from 来自 CODEX_THREAD_ID；同秒同收件人不覆盖。
 watch 默认等到空闲（--until-idle 显式同义），最多 10 分钟；预算耗尽退出 1。
---json stdout 为一个 JSON 对象，心跳与中途回执写 stderr。
+--json stdout 为一个 JSON 对象；watch 心跳与中途回执写 stderr，monitor 不输出逐轮心跳。
 token 只读环境变量或文件，绝不放 argv。`;
 
 function positive(value, name, fallback, integer = true) {
@@ -79,18 +86,23 @@ export function parse(argv) {
   }
   const count = { find: 1, progress: 1, reply: 1, spawn: 1, send: 2, recall: 1, pin: 2, unpin: 1 }[command] ?? 0;
   const mailboxCount = args.length === 0 ? 0 : { read: 2, ack: 2, send: 3 }[args[0]];
-  const invalidCount = command === 'watch' ? args.length < 1 : command === 'mailbox' ? args.length !== mailboxCount : args.length !== count;
+  const monitorCount = args[0] === 'run' ? args.length >= 2 : args[0] === 'ack' ? args.length >= 3 : ['read','status','stop'].includes(args[0]) && args.length === 2;
+  const invalidCount = command === 'monitor' ? !monitorCount : command === 'watch' ? args.length < 1 : command === 'mailbox' ? args.length !== mailboxCount : args.length !== count;
   if (invalidCount || args.some(x => !x.trim())) {
     throw new CliError('invalid-params', '位置参数数量错误或内容为空。');
   }
   if (command === 'mailbox' && ((flags.all && args.length) || (flags['body-file'] !== undefined && args[0] !== 'send'))) {
     throw new CliError('invalid-params', '--all 只适用于信箱列表，--body-file 只适用于 mailbox send。');
   }
+  if (command === 'monitor') {
+    const options = args[0] === 'run' ? ['interval-sec','stale-min','once','max-min'] : args[0] === 'read' ? ['limit'] : [];
+    if (Object.keys(flags).some(key => !['json','owner','base','timeout',...options].includes(key))) throw new CliError('invalid-params', '该 monitor 子命令不支持指定选项。');
+  }
   if (command === 'spawn') flags.ref = normalizeRef(flags.ref);
   flags.waitTimeout = positive(flags.timeout, '--timeout', 45000);
   flags.timeout = positive(flags.timeout, '--timeout', 30000);
   if (flags.lines !== undefined) flags.lines = positive(flags.lines, '--lines', 3);
-  flags.maxMinutes = positive(flags['max-min'], '--max-min', 10, false);
+  flags.maxMinutes = positive(flags['max-min'], '--max-min', command === 'monitor' ? 60 : 10, false);
   if (flags.mode && !['all', 'any'].includes(flags.mode)) throw new CliError('invalid-params', '--mode 只能是 all 或 any。');
   if (flags.model !== undefined && !/^[^/\s]+\/\S+$/.test(flags.model)) {
     throw new CliError('invalid-params', '--model 必须是目录中的 provider/model；先用 dshq models 查真实 ID。');
@@ -144,10 +156,32 @@ export async function run(argv, { env = process.env, home, stdout = process.stdo
     const ids = resolver(client, { store, note });
     const output = (data, text) => out(json ? JSON.stringify(data) : text ?? JSON.stringify(data, null, 2));
     // Local commands work offline, but redact a configured credential without printing it.
-    if (['waves', 'recall', 'pin', 'unpin', 'pins', 'mailbox'].includes(command)) {
+    if (['waves', 'recall', 'pin', 'unpin', 'pins', 'mailbox', 'monitor'].includes(command)) {
       await client.token().catch(e => { if (e.payload?.code !== 'token-missing') throw e; });
     }
     switch (command) {
+      case 'monitor': {
+        const [action, name, ...values] = args;
+        const monitor = new Monitor({ store, owner: flags.owner ?? env.CODEX_THREAD_ID, name });
+        if (action === 'read') output(await monitor.read(positive(flags.limit, '--limit', 20)));
+        else if (action === 'ack') output(await monitor.ack(values));
+        else if (action === 'status') output(await monitor.status());
+        else if (action === 'stop') output(await monitor.stop());
+        else {
+          const targets = [];
+          const resolveQuietly = resolver(client, { store });
+          for (const value of values) targets.push(await resolveQuietly.resolve(value));
+          const controller = new AbortController();
+          const cancel = () => controller.abort();
+          process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
+          try { output(await monitor.run(client, targets, { once: !!flags.once,
+            intervalMs: positive(flags['interval-sec'], '--interval-sec', 30) * 1000,
+            staleMs: positive(flags['stale-min'], '--stale-min', 15, false) * 60000,
+            maxMinutes: flags.maxMinutes, signal: controller.signal })); }
+          finally { process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
+        }
+        break;
+      }
       case 'pin': {
         const sessionId = await ids.resolve(args[0]);
         const data = await store.pin(args[1], sessionId);

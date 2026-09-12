@@ -9,6 +9,12 @@ description: 通过 dsh-task-bridge MCP 工具（dsh_task_spawn/send/progress/wa
 任务会话的行为。核心心智模型：**拉非推（pull, not push）**——你没有入站通道，
 DSH 任务不会主动向你汇报；一切反馈靠你主动 `wait` + `progress` 拉取。
 
+## 长时间静默监控
+
+长时间重复检查可用独立本地进程运行 dshq monitor run；模型无需逐轮介入。通过 monitor read --json 读取未处理摘要，先核对 monitoring 最近检查时间和租约状态，再处理 entries。read 不自动确认，处理后按确切事件 ID 执行 monitor ack；旧 ID 遇到更新时拒绝清除新摘要。初始运行快照不回放旧消息，首次已空闲会留下待检查摘要。
+
+默认按 CODEX_THREAD_ID 隔离；独立进程需要已确认的 --owner。监控仅访问只读桥端点，不自动唤醒 Codex、发消息或执行回信。未读为空不证明监控健康；租约不是进程存活证明。一次反馈查询仍可用 progress/wait，不必启动长期监控。参数与持久化边界见 [本地监控说明](../../docs/local-monitor.md)。
+
 ## 运行能力与增量反馈
 
 新工作阶段先查 dsh_task_capabilities，确认 coordinatorEnabled 和所需能力；能力缺席不代表已安装或已生效。派发显式传 cwd 和已确认的 externalRef；缺省目录来自桥配置或宿主用户目录，不继承 Codex。
