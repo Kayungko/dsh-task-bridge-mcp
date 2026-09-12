@@ -1,3 +1,4 @@
+import { normalizeExternalRef } from '../../src/contract.mjs';
 import { parseArgs } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Client } from './client.mjs';
@@ -13,12 +14,12 @@ const OPTIONS = {
   filter: 'string', ungrouped: 'boolean', all: 'boolean', lines: 'string', title: 'string',
   cwd: 'string', model: 'string', watch: 'boolean', 'auto-retry': 'boolean', steer: 'boolean',
   reference: 'string', mode: 'string', 'until-idle': 'boolean', 'max-min': 'string',
-  'no-ledger': 'boolean', ref: 'string', 'body-file': 'string',
+  'no-ledger': 'boolean', ref: 'string', cursor: 'string', 'message-id': 'string', 'body-file': 'string',
 };
 const ALLOWED = {
-  status: [], list: ['team', 'filter', 'ungrouped', 'all', 'ref'], find: [], progress: [], reply: ['lines'],
+  status: [], list: ['team', 'filter', 'ungrouped', 'all', 'ref'], find: [], progress: ['cursor', 'message-id'], reply: ['lines'],
   spawn: ['title', 'team', 'cwd', 'model', 'watch', 'auto-retry', 'no-ledger', 'ref'], send: ['steer', 'reference'],
-  watch: ['mode', 'until-idle', 'max-min'], models: [], version: [],
+  watch: ['mode', 'until-idle', 'max-min'], models: [], version: [], capabilities: [],
   waves: ['team'], recall: [], pin: [], unpin: [], pins: [], mailbox: ['all', 'body-file'],
 };
 export const HELP = `dshq ${VERSION} — Node.js ≥18.17，无 npm 依赖
@@ -27,13 +28,13 @@ export const HELP = `dshq ${VERSION} — Node.js ≥18.17，无 npm 依赖
 status
 list [--team T] [--filter S] [--ungrouped] [--all] [--ref 子串]
 find <子串>
-progress <会话>
+progress <会话> [--cursor 游标] [--message-id 回执ID] [--json]
 reply <会话> [--lines N]
 spawn <prompt> [--title T] [--team M] [--cwd D] [--model P/M] [--watch] [--auto-retry] [--no-ledger] [--ref 标签]
 send <会话> <text> [--steer] [--reference R]
 watch <会话…> [--mode all|any] [--until-idle] [--max-min M]
 models
-version
+version / capabilities [--json]
 waves [--team T]
 recall <team或子串>
 pin <会话> <别名> / unpin <别名> / pins
@@ -59,11 +60,8 @@ function positive(value, name, fallback, integer = true) {
 }
 
 export function normalizeRef(value) {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'string' || value.trim().length > 200) {
-    throw new CliError('bad-request', 'externalRef 必须是 trim 后 ≤200 字符的字符串。', { exitCode: 1 });
-  }
-  return value.trim() || undefined;
+  try { return normalizeExternalRef(value); }
+  catch (error) { throw new CliError('bad-request', error.message, { exitCode: 1 }); }
 }
 
 export function parse(argv) {
@@ -193,10 +191,18 @@ export async function run(argv, { env = process.env, home, stdout = process.stdo
         else output(await mailbox.send(args[1], args[2], flags['body-file']));
         break;
       }
+      case 'capabilities': { output(await client.request('/v1/capabilities')); break; }
       case 'version': {
-        const bridge = await client.request('/v1/models');
-        const data = { ok: true, cliVersion: VERSION, bridgeReachable: bridge.ok, tokenSource: client.tokenSource };
-        output(data, `dshq ${VERSION}\n桥可达: ${bridge.ok}\ntoken 来源: ${data.tokenSource}`);
+        let bridge;
+        try { bridge = await client.request('/v1/capabilities'); }
+        catch (error) {
+          if (error?.payload?.httpStatus !== 404) throw error;
+          await client.request('/v1/models'); // Old bridge reachability only; do not invent runtime versions/features.
+          bridge = { ok: true, protocolVersion: null, bridgeVersion: null, coordinatorVersion: null,
+            coordinatorEnabled: null, capabilities: null, capabilitiesSupported: false };
+        }
+        const data = { ...bridge, ok: true, cliVersion: VERSION, bridgeReachable: bridge.ok, tokenSource: client.tokenSource };
+        output(data, `dshq ${VERSION}\n桥可达: ${bridge.ok}\ntoken 来源: ${data.tokenSource}\nbridge: ${data.bridgeVersion ?? "unknown"}; coordinator: ${data.coordinatorVersion ?? "unknown"}; enabled: ${data.coordinatorEnabled}\ncapabilities: ${JSON.stringify(data.capabilities)}`);
         break;
       }
       case 'models': {
@@ -225,7 +231,7 @@ export async function run(argv, { env = process.env, home, stdout = process.stdo
       case 'progress':
       case 'reply': {
         const sessionId = await ids.resolve(args[0]);
-        const raw = await client.request('/v1/progress', { query: { sessionId } });
+        const raw = await client.request('/v1/progress', { query: { sessionId, cursor: flags.cursor, messageId: flags['message-id'] } });
         if (command === 'progress') output(raw, progressText(raw));
         else { const data = replies(raw, flags.lines); output(data, replyText(data)); }
         break;

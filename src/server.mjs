@@ -42,7 +42,7 @@ function errorToToolResult(err) {
     error = err.message;
   } else {
     code = 'internal-error';
-    error = `dsh-task-bridge-mcp 内部错误：${err?.stack ?? err}`;
+    error = 'dsh-task-bridge-mcp 内部错误';
   }
   const envelope = { ok: false, code, error };
   if (err instanceof BridgeApiError) {
@@ -52,6 +52,7 @@ function errorToToolResult(err) {
   }
   return {
     content: [{ type: 'text', text: JSON.stringify(envelope) }],
+    structuredContent: envelope,
     isError: true,
   };
 }
@@ -81,9 +82,11 @@ export function handleRpcMessage(msg, ctx) {
         instructions: INSTRUCTIONS,
       });
     }
+    case 'notifications/cancelled':
+      ctx.requests?.get(params?.requestId)?.abort();
+      return null;
     case 'initialized':
     case 'notifications/initialized':
-    case 'notifications/cancelled':
     case 'notifications/roots/list_changed':
     case 'notifications/progress':
       return null;
@@ -91,7 +94,7 @@ export function handleRpcMessage(msg, ctx) {
       return jsonRpcResult(id, {});
     case 'tools/list':
       return jsonRpcResult(id, {
-        tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+        tools: TOOLS.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, annotations })),
       });
     case 'tools/call': {
       const name = params?.name;
@@ -100,18 +103,23 @@ export function handleRpcMessage(msg, ctx) {
         return jsonRpcError(id, -32602, `Unknown tool: ${name}`);
       }
       // handler 是 async；把 Promise 交回调用方（stdio 循环 await 后写 stdout）。
+      const controller = new AbortController();
+      ctx.requests ??= new Map();
+      ctx.requests.set(id, controller);
+      const client = { request: (method, path, options = {}) => ctx.client.request(method, path, { ...options, signal: controller.signal }) };
       const p = (async () => {
         let result;
         try {
-          result = await tool.handler(ctx.client, params?.arguments ?? {});
+          result = await tool.handler(client, params?.arguments ?? {});
         } catch (err) {
           return errorToToolResult(err);
         }
         return {
           content: [{ type: 'text', text: JSON.stringify(result) }],
+          structuredContent: result,
         };
       })();
-      return p.then((toolResult) => jsonRpcResult(id, toolResult));
+      return p.then((toolResult) => jsonRpcResult(id, toolResult)).finally(() => ctx.requests.delete(id));
     }
     default:
       if (isNotification) return null; // 未知通知按规范静默忽略

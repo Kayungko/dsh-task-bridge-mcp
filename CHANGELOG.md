@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased] — Codex 协作增量
+
+CLI/MCP 共用回环传输、全响应超时与脱敏；MCP 请求取消、externalRef、只读标记与结构化结果；运行能力查询和增量 progress；新增回归与随包使用文档。
+
+仅源码变更，不表示已部署、重启或完成实机验收。
+
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 

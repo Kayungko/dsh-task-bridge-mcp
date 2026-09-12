@@ -1,3 +1,4 @@
+import { normalizeExternalRef } from './contract.mjs';
 // dsh-task-bridge-mcp —— MCP 工具定义与 handler
 // 工具集镜像桥 MVP 6 端点（research/task-bridge-reanchoring.md §0.2/§3）：
 //   spawn / send / progress / wait / list / models
@@ -27,7 +28,9 @@ function requireString(args, key) {
 
 function optionalString(args, key) {
   const v = args?.[key];
-  return typeof v === 'string' && v.trim() ? v : undefined;
+  if (v == null) return undefined;
+  if (typeof v !== 'string') throw new ToolValidationError(`参数 ${key} 必须是字符串`);
+  return v.trim() || undefined;
 }
 
 /** 归一化 wait 的目标列表：接受单字符串或字符串数组。 */
@@ -42,7 +45,7 @@ function normalizeSessionIds(args) {
 }
 
 export const INSTRUCTIONS = [
-  'DSH task-bridge 拉模型（pull-model）操作纪律：',
+  'DSH 外部编排：仅在用户授权范围内派发/发消息。先查 dsh_task_capabilities；模型 ID 从 dsh_task_models 获取。spawn 显式传 cwd、externalRef，串行派发。delivered≠消费，idle/settled≠验收完成；未知目标须报错。反馈采用拉模型：wait 分段等，settled:false 正常；progress 用 cursor 只读增量。写请求超时先对账，勿盲目重发。',
   '1) 派发用 dsh_task_spawn 串行进行——桥侧策略闸限制滚动 60s 窗口内最多 10 次 spawn，超限返回 429 policy-gated（附 retryAfterMs）：读 retryAfterMs 等待后再重试，串行派发天然低触发。spawn 回执必读 workspace/placement/modelSource：ungrouped/worktree 落位（含 warning）须先补救或确认接受；模型路线不符预期立即停止并纠正。',
   '2) 反馈一律拉取（reportBack 已结构性关闭）：用 dsh_task_wait 分段等待（timeoutMs 默认 45000、上限 50000；settled:false 是正常心跳而非错误，续 call 即可），配合 dsh_task_progress 读 recent 尾部/todos/goal/agentState 判断进展。禁止高频轮询轰炸：wait 长轮询本身就是等待，progress 仅在 wait 返回 settled 或需要决策时读取。',
   '3) 纠偏用 dsh_task_send：目标运行中用 mode=steer（下一生效步骤生效）；空闲目标或追加上下文用默认 queue。回执 queueDepth.nextTurn>=2 表示该消息约 2 轮后才被读——改用 steer 或先等一轮，避免晚一步白干一步。',
@@ -59,7 +62,7 @@ export const TOOLS = [
       '参数：prompt（必填，完整自包含的 kickoff 指令——目标会话看不到当前对话，须包含全部所需上下文）；' +
       'title（可选，"类型｜主题" 语义，如 "修复｜对账精度"，日期前缀自动添加）；' +
       'team（可选，编组名，同 team 任务可在 dsh_task_list 中过滤）；' +
-      'cwd（可选，工作目录，缺省继承调用方）；' +
+      'cwd（可选，建议显式传入；缺省为桥配置 defaultCwd 或宿主用户目录，不继承 Codex 目录）；' +
       'provider/model/reasoningEffort（可选，模型路线；不确定合法 id 先调 dsh_task_models，绝不猜）。' +
       '注意：本工具结构性关闭 reportBack（无此参数），新任务不会主动回报——反馈靠 dsh_task_wait/dsh_task_progress 拉取。' +
       '成功回执字段：sessionId、shortId、title、team、cwd、workspace（{id,title} 或 null）、' +
@@ -74,7 +77,8 @@ export const TOOLS = [
         prompt: { type: 'string', description: '完整自包含的 kickoff 指令（新会话不共享当前上下文）' },
         title: { type: 'string', description: '会话标题语义部分："类型｜主题"（如 "修复｜对账精度"）' },
         team: { type: 'string', description: '编组（workstream）名，供 list 过滤' },
-        cwd: { type: 'string', description: '新任务工作目录（Windows 原生路径）' },
+        cwd: { type: 'string', description: '新任务工作目录，建议显式传入；不自动继承 Codex cwd' },
+        externalRef: { type: 'string', description: '完整外部任务/波次标识，trim 后不超过 200 字符；缺少身份时勿猜测' },
         provider: { type: 'string', description: 'LLM provider id（先查 dsh_task_models）' },
         model: { type: 'string', description: 'model id（与 provider 一起提供）' },
         reasoningEffort: { type: 'string', description: '推理力度（如 low/medium/high，按 models 目录支持情况）' },
@@ -87,6 +91,8 @@ export const TOOLS = [
         const v = optionalString(args, key);
         if (v !== undefined) body[key] = v;
       }
+      try { const ref = normalizeExternalRef(args?.externalRef); if (ref !== undefined) body.externalRef = ref; }
+      catch (error) { throw new ToolValidationError(error.message); }
       return client.request('POST', '/v1/spawn', { body });
     },
   },
@@ -140,12 +146,14 @@ export const TOOLS = [
       type: 'object',
       properties: {
         sessionId: { type: 'string', description: '目标会话 id' },
+        cursor: { type: 'string', description: '上次 feedback.nextCursor；仅增量读取，缺口见 feedback.coverage' },
+        messageId: { type: 'string', description: '要对账的 send 回执 ID；consumption 仅区分 queued/observed/unknown，不代表工作完成' },
       },
       required: ['sessionId'],
     },
     async handler(client, args) {
       const sessionId = requireString(args, 'sessionId');
-      return client.request('GET', '/v1/progress', { query: { sessionId } });
+      return client.request('GET', '/v1/progress', { query: { sessionId, cursor: optionalString(args, 'cursor'), messageId: optionalString(args, 'messageId') } });
     },
   },
   {
@@ -235,5 +243,15 @@ export const TOOLS = [
     },
   },
 ];
+
+TOOLS.push({
+  name: 'dsh_task_capabilities', description: '只读查询运行中桥与 coordinator 版本、能力和等待上限；缺席或禁用不伪装成可用。',
+  inputSchema: { type: 'object', properties: {} },
+  handler: client => client.request('GET', '/v1/capabilities'),
+});
+for (const tool of TOOLS) {
+  const readOnly = !['dsh_task_spawn', 'dsh_task_send'].includes(tool.name);
+  tool.annotations = { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: readOnly, openWorldHint: !readOnly };
+}
 
 export const TOOL_NAMES = TOOLS.map((t) => t.name);

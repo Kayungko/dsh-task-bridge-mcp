@@ -10,12 +10,14 @@ Codex CLI ──MCP stdio(JSON-RPC)──> dsh-task-bridge-mcp ──HTTP(fetch)
 - 设计蓝图：[`research/task-bridge-reanchoring.md`](../research/task-bridge-reanchoring.md) §4（MCP stdio wrapper 推荐）+ §3（端点清单与回执字段）。
 - **零运行时依赖**（见下方选型说明），Node.js ≥ 18.17（用内置 fetch / AbortController / readline）。
 
+当前源码新增能力查询、MCP/CLI 统一传输及增量反馈，见 [Codex 接入增量契约](docs/codex-integration.md)。运行状态以 capabilities 回执为准。
+
 ## SDK 选型说明：手写 JSON-RPC，不用 @modelcontextprotocol/sdk
 
 按蓝图 §4 结论二选一，本项目选手写 JSON-RPC 2.0，理由：
 
 1. **协议面极小且稳定**：本 wrapper 只需实现 `initialize`（含 `instructions`）/
-   `tools/list` / `tools/call` / `ping` 四个方法 + 通知忽略，NDJSON 行协议即全部复杂度。
+   `tools/list` / `tools/call` / `ping` 四个方法 + 请求取消通知处理，NDJSON 行协议即全部复杂度。
    SDK 的传输抽象、能力协商、资源/提示等能力对本场景是死重。
 2. **零依赖 = 零安装**：Codex 直接 `node …/src/server.mjs` 启动，无需 `npm install`，
    bring-up 阶段零摩擦；也避免供应链与 SDK 版本钉扎问题。
@@ -32,7 +34,7 @@ git clone <repo> D:\git\DHS-Tool\bridge-mcp   # 或已就位
 
 # 2. 无依赖可装；如需跑离线测试：
 cd D:\git\DHS-Tool\bridge-mcp
-npm test        # node --test test/smoke.mjs（mock REST server，不依赖真桥）
+npm test        # MCP/CLI 离线回归（mock REST server，不依赖真桥）
 ```
 
 运行要求：Node.js ≥ 18.17；DSH Desktop 运行中且 dsh-plugin-task-bridge 已启用
@@ -60,7 +62,7 @@ tool_timeout_sec = 60          # wrapper 的 wait 工具已按 50s 上限钳制�
 # 可选：工具白名单（与桥端点白名单对齐）
 # enabled_tools = [
 #   "dsh_task_spawn", "dsh_task_send", "dsh_task_progress",
-#   "dsh_task_wait",  "dsh_task_list", "dsh_task_models",
+#   "dsh_task_wait",  "dsh_task_list", "dsh_task_models", "dsh_task_capabilities",
 # ]
 
 # 可选：写操作保留 Codex 侧人工批准门（与 DSH 侧策略闸双层呼应，蓝图 §4.3）
@@ -143,7 +145,7 @@ npm test        # 离线 smoke：node:http mock REST server，10 个用例全绿
 ```
 src/server.mjs   MCP stdio 入口（JSON-RPC 循环 + 错误映射）
 src/client.mjs   REST client（token 解析 / fetch 超时 / 信封错误映射）
-src/tools.mjs    6 工具定义（inputSchema/description/handler）+ instructions
+src/tools.mjs    7 工具定义（inputSchema/description/handler）+ instructions
 test/smoke.mjs   离线 smoke 测试（mock 桥）
 skills/dsh-task-bridge/SKILL.md   Codex 侧使用纪律（拉模型/策略闸/回执解读/错误码表）
 ```
@@ -151,7 +153,7 @@ skills/dsh-task-bridge/SKILL.md   Codex 侧使用纪律（拉模型/策略闸/�
 ## dshq CLI
 
 `cli/dshq.mjs` 为 Codex 侧编排 CLI v0.1.0（零 npm 依赖 Node ESM，Node.js ≥18.17）。
-独立消费桥的六个 REST 端点，不修改 MCP 配置或宿主。PowerShell 当前进程可定义：
+消费六个业务 REST 端点和只读 capabilities 端点，不修改 MCP 配置或宿主。PowerShell 当前进程可定义：
 
 ```powershell
 function dshq { & node 'D:\git\DHS-Tool\bridge-mcp\cli\dshq.mjs' @args }

@@ -33,6 +33,7 @@ let expectedToken = fake;
 let mockFailure;
 function defaults(req) {
   switch (req.path) {
+    case '/v1/capabilities': return { ok: true, bridgeVersion: 'mock', coordinatorVersion: 'mock', coordinatorEnabled: true, capabilities: { progressCursor: true } };
     case '/v1/list': return { ok: true, count: tasks.length, truncated: false, tasks };
     case '/v1/models': return { ok: true, default: { provider: 'p', model: 'm' }, pluginDefault: null,
       providers: [{ id: 'p', models: [{ id: 'm', efforts: ['high'] }] }] };
@@ -170,11 +171,28 @@ try {
     r = await invoke(['send', id, '排队']);
     assert.equal(requests[1].body.mode, 'queue'); assert.equal(requests[1].body.message, undefined);
   });
-  await check('models/version 使用 GET models，version 只显示 token 来源', async () => {
+  await check('models 查询模型，version 查询运行能力且只显示 token 来源', async () => {
     assert.equal((await invoke(['models', '--json'])).data.providers[0].id, 'p');
     const r = await invoke(['version', '--json']);
     assert.equal(r.data.tokenSource, 'env:TASK_BRIDGE_TOKEN'); assert.equal(r.data.bridgeReachable, true);
-    for (const req of requests) { assert.equal(req.path, '/v1/models'); assert.equal(req.method, 'GET'); assert.deepEqual(req.query, {}); }
+    assert.deepEqual(requests.map(r => r.path), ['/v1/models', '/v1/capabilities']);
+    assert.equal(r.data.coordinatorEnabled, true);
+    for (const req of requests) { assert.equal(req.method, 'GET'); assert.deepEqual(req.query, {}); }
+  });
+  await check('旧桥无 capabilities 时 version 降级为可达但能力未知，增量参数仍透传', async () => {
+    responder = (req, res) => {
+      if (req.path === '/v1/capabilities') { res.statusCode = 404; return { ok: false, code: 'not-found', error: 'unknown route' }; }
+      return defaults(req);
+    };
+    const old = await invoke(['version', '--json']);
+    assert.equal(old.code, 0);
+    assert.equal(old.data.bridgeReachable, true);
+    assert.equal(old.data.capabilities, null);
+    assert.equal(old.data.bridgeVersion, null);
+    const progress = await invoke(['progress', id, '--cursor', 'opaque', '--message-id', 'm', '--json']);
+    assert.equal(progress.code, 0);
+    assert.equal(requests.at(-1).query.cursor, 'opaque');
+    assert.equal(requests.at(-1).query.messageId, 'm');
   });
   await check('八个桥错误码映射退出 2、补救字段保留', async () => {
     const cases = [

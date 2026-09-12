@@ -377,7 +377,7 @@ test('JSON-RPC 协议分支：initialize / tools/list / notifications / ping / �
   const listResp = await handleRpcMessage({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }, ctx);
   const names = listResp.result.tools.map((x) => x.name);
   assert.deepEqual(names.sort(), [
-    'dsh_task_list', 'dsh_task_models', 'dsh_task_progress',
+    'dsh_task_capabilities', 'dsh_task_list', 'dsh_task_models', 'dsh_task_progress',
     'dsh_task_send', 'dsh_task_spawn', 'dsh_task_wait',
   ], '工具集必须镜像桥 MVP 6 端点');
   const spawnTool = listResp.result.tools.find((x) => x.name === 'dsh_task_spawn');
@@ -472,7 +472,7 @@ test('stdio 循环回归：真实子进程 + 管道，stdin EOF 后在途 tools/
   assert.equal(init.result.serverInfo.name, 'dsh-task-bridge-mcp');
   assert.ok(init.result.instructions.length > 200);
   assert.equal(list.id, 2);
-  assert.equal(list.result.tools.length, 6);
+  assert.equal(list.result.tools.length, 7);
   assert.equal(call.id, 3);
   assert.equal(call.result.isError, undefined, 'tools/call 应成功');
   const payload = JSON.parse(call.result.content[0].text);

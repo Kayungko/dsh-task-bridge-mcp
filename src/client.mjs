@@ -7,6 +7,7 @@
 //   - 应答信封 {ok:true,...} / {ok:false,code,error}；
 //     ok:false 一律抛 BridgeApiError（code+error 透传），绝不吞错。
 
+import { requestJson, TransportError, bridgeUrl } from './transport.mjs';
 import { homedir } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -98,7 +99,7 @@ export class BridgeClient {
    * @param {number} [options.defaultTimeoutMs] 单请求缺省超时，默认 30000
    */
   constructor({ baseUrl, resolveTokenFn, fetchImpl, defaultTimeoutMs = 30000, env = process.env } = {}) {
-    this.baseUrl = (baseUrl ?? env.TASK_BRIDGE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+    this.baseUrl = bridgeUrl(baseUrl ?? env.TASK_BRIDGE_URL ?? DEFAULT_BASE_URL, '/v1/models').origin;
     this.resolveTokenFn = resolveTokenFn ?? (() => resolveToken(env));
     this.fetchImpl = fetchImpl ?? fetch;
     this.defaultTimeoutMs = defaultTimeoutMs;
@@ -118,70 +119,21 @@ export class BridgeClient {
    * @throws {BridgeClientError} 网络层 / 协议层失败
    * @throws {BridgeApiError} 桥端 ok:false（code+error 透传）
    */
-  async request(method, path, { query, body, timeoutMs } = {}) {
-    const url = new URL(this.baseUrl + path);
-    if (query) {
-      for (const [key, value] of Object.entries(query)) {
-        if (value === undefined || value === null || value === '') continue;
-        url.searchParams.set(key, String(value));
-      }
-    }
-
-    const headers = { accept: 'application/json' };
-    headers[TOKEN_HEADER] = this.resolveTokenFn();
-    if (body !== undefined) headers['content-type'] = 'application/json';
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error(`client timeout after ${timeoutMs ?? this.defaultTimeoutMs}ms`)),
-      timeoutMs ?? this.defaultTimeoutMs);
-    let res;
+  async request(method, path, { query, body, timeoutMs, signal } = {}) {
+    let response;
     try {
-      res = await this.fetchImpl(url.toString(), {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      const aborted = controller.signal.aborted === true || err?.name === 'AbortError';
-      if (aborted) {
-        throw new BridgeClientError('bridge-timeout',
-          `请求 ${method} ${path} 超过 ${timeoutMs ?? this.defaultTimeoutMs}ms 未响应（bridge-timeout）。` +
-          '若这是 dsh_task_wait 调用，请缩短 timeoutMs（上限 50000ms）后重试。', { cause: err });
-      }
-      throw new BridgeClientError('bridge-unreachable',
-        `无法连接 task-bridge（${method} ${url.host}${path}）：${err?.cause?.code ?? err?.message ?? err}。` +
-        `请确认 DSH Desktop 已运行且 dsh-plugin-task-bridge 已启用（默认 ${DEFAULT_BASE_URL}，可用 env TASK_BRIDGE_URL 覆盖）。`,
-        { cause: err });
-    } finally {
-      clearTimeout(timer);
+      response = await requestJson({ base: this.baseUrl, path, method, query, body,
+        timeoutMs: timeoutMs ?? this.defaultTimeoutMs, signal,
+        getToken: this.resolveTokenFn, fetchImpl: this.fetchImpl });
+    } catch (error) {
+      if (error instanceof TransportError) throw new BridgeClientError(error.code, error.message);
+      throw error;
     }
-
-    const text = await res.text().catch(() => '');
-    let json = null;
-    try {
-      json = text ? JSON.parse(text) : null;
-    } catch {
-      // 落到下方 invalid-response 分支
+    const { data, status } = response;
+    if (data.ok === false) {
+      const { ok, code, error, ...extras } = data;
+      throw new BridgeApiError(code, error, status, extras);
     }
-
-    if (json && typeof json === 'object' && json.ok === false) {
-      // 桥端业务失败：code+error 透传（无论 HTTP 状态码 4xx/5xx）。
-      const code = typeof json.code === 'string' && json.code ? json.code : 'bridge-error';
-      const errorText = typeof json.error === 'string' ? json.error : JSON.stringify(json.error ?? '');
-      const { ok: _ok, code: _code, error: _error, ...extras } = json;
-      throw new BridgeApiError(code, errorText, res.status, extras);
-    }
-    if (!res.ok) {
-      throw new BridgeClientError('bridge-http-error',
-        `task-bridge 返回 HTTP ${res.status}（${method} ${path}），且响应体不是 {ok:false,code,error} 信封。` +
-        `body 前 200 字符：${text.slice(0, 200)}`);
-    }
-    if (!json || typeof json !== 'object' || json.ok !== true) {
-      throw new BridgeClientError('bridge-invalid-response',
-        `task-bridge 响应不是合法的 {ok:true,...} 信封（HTTP ${res.status}，${method} ${path}）。` +
-        `body 前 200 字符：${text.slice(0, 200)}`);
-    }
-    return json;
+    return data;
   }
 }

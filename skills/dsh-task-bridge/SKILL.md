@@ -1,6 +1,6 @@
 ---
 name: dsh-task-bridge
-description: 通过 dsh-task-bridge MCP 工具（dsh_task_spawn/send/progress/wait/list/models）驱动 DSH Desktop 任务会话时的使用纪律：拉模型循环、串行派发过策略闸、回执字段解读、错误码处置。凡调用任一 dsh_task_* 工具前必读。
+description: 通过 dsh-task-bridge MCP 工具（dsh_task_spawn/send/progress/wait/list/models/capabilities）驱动 DSH Desktop 任务会话时的使用纪律：拉模型循环、串行派发过策略闸、回执字段解读、错误码处置。凡调用任一 dsh_task_* 工具前必读。
 ---
 
 # DSH task-bridge 使用纪律（Codex 侧）
@@ -8,6 +8,14 @@ description: 通过 dsh-task-bridge MCP 工具（dsh_task_spawn/send/progress/wa
 本 skill 约束通过 `dsh-task-bridge` MCP server（工具前缀 `dsh_task_`）驱动 DSH Desktop
 任务会话的行为。核心心智模型：**拉非推（pull, not push）**——你没有入站通道，
 DSH 任务不会主动向你汇报；一切反馈靠你主动 `wait` + `progress` 拉取。
+
+## 运行能力与增量反馈
+
+新工作阶段先查 dsh_task_capabilities，确认 coordinatorEnabled 和所需能力；能力缺席不代表已安装或已生效。派发显式传 cwd 和已确认的 externalRef；缺省目录来自桥配置或宿主用户目录，不继承 Codex。
+
+progress 返回 feedback.nextCursor 时保存并原样传给下一次 progress；有游标时读取 feedback.messages（recent 为空）。hasMore=true 可继续读取；coverage=partial/unavailable 必须保留缺口，截断长文继续用信箱或产物引用。messageId 可对账 queued/observed/unknown；observed 只证明消息已出现在扫描转录，不证明执行或完成。
+
+未知任务应返回 not-found，不能当作 cold-idle。MCP 请求取消只停止本地等待，不等于取消 DSH 任务或撤销已派发消息。receiptPersisted=false 时保留派发回执并对账，不重派。完整字段见 [接入契约](../../docs/codex-integration.md)。
 
 ## 0. 心智模型
 
