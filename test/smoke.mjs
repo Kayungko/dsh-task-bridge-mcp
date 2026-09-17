@@ -360,7 +360,7 @@ test('JSON-RPC 协议分支：initialize / tools/list / notifications / ping / �
   );
   assert.equal(init.result.protocolVersion, '2025-06-18');
   assert.equal(init.result.serverInfo.name, 'dsh-task-bridge-mcp');
-  assert.equal(init.result.serverInfo.version, '0.1.1');
+  assert.equal(init.result.serverInfo.version, '0.4.0'); // 0.4.0 起 serverInfo 随 package.json（评审 P2-1 版本轨道收敛）
   assert.ok(init.result.instructions.length > 200, 'instructions 必须载拉模型纪律');
   for (const kw of ['拉', '串行', 'policy-gated', 'retryAfterMs', 'settled:false', 'queueDepth', 'progress', 'dsh_task_models']) {
     assert.ok(INSTRUCTIONS.includes(kw), `instructions 须覆盖纪律关键词：${kw}`);

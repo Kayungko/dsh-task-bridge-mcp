@@ -5,6 +5,8 @@
 ### 收编正式化（0918 总控）
 
 - 收编 09-12 Codex 协作波次已提交两件（0ff3346 统一桥传输+可靠 Codex 反馈 / 892e7d4 本地静默监控器）与**未提交半成品**（workflow v1 控制面 + dsh-orchestration skill 统一入口 + 离线技能打包器，脏树 7 改 11 增）。收编时自洽验证：cli smoke 33/33 + workflow 20/20 + skills-package 3/3 全绿。workflow v1 标注为**本地 CLI 控制面首版**（不自动迁移旧 monitor/任务，不启动自动化）。
+- 版本轨道收敛（评审 P2-1）：自本版起 **git tag 为唯一发布号**，package.json（=MCP serverInfo=打包 manifest）与 CLI banner（运行时读 package.json）随 tag 对齐；历史 tag v0.2.0/v0.3.0 为内部发布点（CLI 工具包波次/传输统一+监控器波次），变更明细见提交历史，不回填 CHANGELOG 节。
+- **managed 策略纪律闸接受记录（评审 P2-3，总控 0918 显式接受）**：workflow managed 策略可在 policy 范围内自动向 DSH send（无逐项人工确认；全链无 spawn 路径），authorizationRef 为 controller 自填文本、代码不可验证人类授权真实性——属纪律闸而非机械闸（workflow-v1.md 已披露）。总控显式接受该残余风险：本地信任模型、严格窄于既有 dshq send 直通能力（加闸非开闸）；approver 身份字段增强列 backlog。
 
 ### Codex 协作增量（09-12 波次原文）
 

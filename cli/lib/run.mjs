@@ -10,7 +10,12 @@ import { table, fleet, fleetText, progressText, replies, replyText } from './for
 import { Store, waveMatches, liveWaves } from './store.mjs';
 import { Mailbox, mailTable } from './mailbox.mjs';
 
-export const VERSION = '0.2.0';
+import { readFileSync as __dshqPkgFs } from 'node:fs';
+// 0.4.0 release hygiene (P2-1): single source = package.json; the packaged-skill
+// layout has no ../../package.json, so fall back to the literal at pack time.
+export const VERSION = (() => {
+  try { return JSON.parse(__dshqPkgFs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version } catch { return '0.4.0' }
+})();
 const OPTIONS = {
   'input-file': 'string', 'actor-platform': 'string', 'host-id': 'string',
   owner: 'string', 'interval-sec': 'string', 'stale-min': 'string', once: 'boolean', limit: 'string',

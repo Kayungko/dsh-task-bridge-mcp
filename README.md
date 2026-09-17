@@ -169,7 +169,7 @@ skills/dsh-task-bridge/SKILL.md   Codex 侧使用纪律（拉模型/策略闸/�
 
 ## dshq CLI
 
-`cli/dshq.mjs` 为 Codex 侧编排 CLI v0.1.0（零 npm 依赖 Node ESM，Node.js ≥18.17）。
+`cli/dshq.mjs` 为 Codex 侧编排 CLI（版本随仓 tag，运行时读 package.json；零 npm 依赖 Node ESM，Node.js ≥18.17）。
 消费六个业务 REST 端点和只读 capabilities 端点，不修改 MCP 配置或宿主。PowerShell 当前进程可定义：
 
 ```powershell
