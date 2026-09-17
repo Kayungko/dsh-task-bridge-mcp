@@ -10,7 +10,8 @@
     "node": ">=18.17"
   },
   "scripts": {
-    "check": "node --check cli/lib/monitor.mjs && node --check cli/lib/run.mjs && node --check src/contract.mjs && node --check src/transport.mjs && node --check src/server.mjs && node --check src/client.mjs && node --check src/tools.mjs",
+    "package:skills": "node scripts/package-skills.mjs",
+    "check": "node --check scripts/package-skills.mjs && node --check skills/dsh-orchestration/scripts/dshq.mjs && node --check cli/lib/workflow-contract.mjs && node --check cli/lib/workflow.mjs && node --check cli/lib/workflow-adapter.mjs && node --check cli/lib/workflow-cli.mjs && node --check cli/lib/monitor.mjs && node --check cli/lib/run.mjs && node --check src/contract.mjs && node --check src/transport.mjs && node --check src/server.mjs && node --check src/client.mjs && node --check src/tools.mjs",
     "test": "node --test test/*.mjs cli/test/smoke.mjs"
   },
   "keywords": [

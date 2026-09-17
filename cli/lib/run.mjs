@@ -1,3 +1,4 @@
+import { workflowCommand, WORKFLOW_ACTIONS } from './workflow-cli.mjs';
 import { Monitor } from './monitor.mjs';
 import { normalizeExternalRef } from '../../src/contract.mjs';
 import { parseArgs } from 'node:util';
@@ -11,6 +12,7 @@ import { Mailbox, mailTable } from './mailbox.mjs';
 
 export const VERSION = '0.2.0';
 const OPTIONS = {
+  'input-file': 'string', 'actor-platform': 'string', 'host-id': 'string',
   owner: 'string', 'interval-sec': 'string', 'stale-min': 'string', once: 'boolean', limit: 'string',
   json: 'boolean', base: 'string', timeout: 'string', help: 'boolean', team: 'string',
   filter: 'string', ungrouped: 'boolean', all: 'boolean', lines: 'string', title: 'string',
@@ -19,6 +21,7 @@ const OPTIONS = {
   'no-ledger': 'boolean', ref: 'string', cursor: 'string', 'message-id': 'string', 'body-file': 'string',
 };
 const ALLOWED = {
+  workflow: ['owner', 'input-file', 'actor-platform', 'host-id', 'limit', 'cursor'],
   monitor: ['owner', 'interval-sec', 'stale-min', 'once', 'max-min', 'limit'],
   status: [], list: ['team', 'filter', 'ungrouped', 'all', 'ref'], find: [], progress: ['cursor', 'message-id'], reply: ['lines'],
   spawn: ['title', 'team', 'cwd', 'model', 'watch', 'auto-retry', 'no-ledger', 'ref'], send: ['steer', 'reference'],
@@ -26,8 +29,11 @@ const ALLOWED = {
   waves: ['team'], recall: [], pin: [], unpin: [], pins: [], mailbox: ['all', 'body-file'],
 };
 export const HELP = `dshq ${VERSION} — Node.js ≥18.17，无 npm 依赖
-用法：node D:/git/DHS-Tool/bridge-mcp/cli/dshq.mjs <命令> [参数]
+用法：node <toolkit>/cli/dshq.mjs <命令> [参数]（也可用技能目录 scripts/dshq.mjs）
 全局：--json --base <回环URL> --timeout <ms> --help
+workflow create --input-file <配置JSON>
+workflow <操作> <工作流ID> [--input-file <JSON>] [--owner <调用会话>]
+workflow 操作：status/next/notices/add/policy/approve/claim/finish/revise/event/wait/resume/cancel/rebind/handoff/poll/send/reconcile/mark-notices
 status
 list [--team T] [--filter S] [--ungrouped] [--all] [--ref 子串]
 find <子串>
@@ -87,7 +93,8 @@ export function parse(argv) {
   const count = { find: 1, progress: 1, reply: 1, spawn: 1, send: 2, recall: 1, pin: 2, unpin: 1 }[command] ?? 0;
   const mailboxCount = args.length === 0 ? 0 : { read: 2, ack: 2, send: 3 }[args[0]];
   const monitorCount = args[0] === 'run' ? args.length >= 2 : args[0] === 'ack' ? args.length >= 3 : ['read','status','stop'].includes(args[0]) && args.length === 2;
-  const invalidCount = command === 'monitor' ? !monitorCount : command === 'watch' ? args.length < 1 : command === 'mailbox' ? args.length !== mailboxCount : args.length !== count;
+  const workflowCount = Object.hasOwn(WORKFLOW_ACTIONS, args[0] ?? '') && args.length === (args[0] === 'create' ? 1 : 2);
+  const invalidCount = command === 'workflow' ? !workflowCount : command === 'monitor' ? !monitorCount : command === 'watch' ? args.length < 1 : command === 'mailbox' ? args.length !== mailboxCount : args.length !== count;
   if (invalidCount || args.some(x => !x.trim())) {
     throw new CliError('invalid-params', '位置参数数量错误或内容为空。');
   }
@@ -156,10 +163,11 @@ export async function run(argv, { env = process.env, home, stdout = process.stdo
     const ids = resolver(client, { store, note });
     const output = (data, text) => out(json ? JSON.stringify(data) : text ?? JSON.stringify(data, null, 2));
     // Local commands work offline, but redact a configured credential without printing it.
-    if (['waves', 'recall', 'pin', 'unpin', 'pins', 'mailbox', 'monitor'].includes(command)) {
+    if (['waves', 'recall', 'pin', 'unpin', 'pins', 'mailbox', 'monitor', 'workflow'].includes(command)) {
       await client.token().catch(e => { if (e.payload?.code !== 'token-missing') throw e; });
     }
     switch (command) {
+      case 'workflow': { output(await workflowCommand(args, flags, { store, env, home })); break; }
       case 'monitor': {
         const [action, name, ...values] = args;
         const monitor = new Monitor({ store, owner: flags.owner ?? env.CODEX_THREAD_ID, name });

@@ -14,6 +14,21 @@ Codex CLI ──MCP stdio(JSON-RPC)──> dsh-task-bridge-mcp ──HTTP(fetch)
 
 长时间监控可用 `dshq monitor run/read/ack/status/stop`：本地静默检查，按 Codex 任务隔离游标与摘要，不调用模型。用法和边界见 [本地静默监控器](docs/local-monitor.md)。
 
+通用多事项协作新增 `dshq workflow`：持久事项独立于会话，支持通知隔离、授权模式、领取/复审/转交及外部发送对账。先读 [工作流 v1 契约](docs/workflow-v1.md)，需要总控模板时再读 [代理推进模板](docs/workflow-agent-template.md)。首版是本地 CLI 控制面，不自动迁移已有任务或启动自动化。
+
+## 编排 Skill 源码与待部署包
+
+通用入口维护在 [dsh-orchestration](skills/dsh-orchestration/SKILL.md)，按需加载单步操作、监控、工作流和桥接协议。旧 [dsh-task-bridge](skills/dsh-task-bridge/SKILL.md) 保留为协议参考；部署包只有一个可发现的 Skill，避免双入口重复加载。
+
+```powershell
+node scripts/package-skills.mjs --out '<绝对路径的空暂存目录>'
+node '<暂存目录>/dsh-orchestration/scripts/dshq.mjs' --help
+```
+
+打包器仅准备文件，拒绝写入源码、全局技能和 DSH 目录，拒绝覆盖非空输出。产物包含自带 CLI/MCP 运行代码的 `dsh-orchestration/` 和 SHA-256 清单 `bundle-manifest.json`，不复制凭据、用户配置或任务状态，无需 npm install。清单用于核对内容，不证明产物已经安装。
+
+待用户授权部署时，再核对并备份现有技能及其本地定制，部署完整技能目录；只复制 SKILL.md 会缺少引用和运行代码。DSH 插件部署、宿主重启、既有自动化及工作流迁移分别核验，不由打包器执行。仓库源码入口定位同仓 CLI，完整技能包优先使用内嵌运行代码；只有显式设置 DSHQ_HOME 时才改用指定工具包。
+
 ## SDK 选型说明：手写 JSON-RPC，不用 @modelcontextprotocol/sdk
 
 按蓝图 §4 结论二选一，本项目选手写 JSON-RPC 2.0，理由：
@@ -215,7 +230,7 @@ spawn-depth-exceeded 不重试。rate-limited、queue-full、网络失败均不�
 reply 保留 `(+N chars)` 摘录截断标记，提示「请 DSH 重发短回信」，不猜测缺失内容。
 recent 为空会提示检查是否有转录，以及宿主是否已重启到 task-coordinator v0.24.1+。
 
-本机配套 skill：`C:\Users\admin\.agents\skills\dsh-orchestration\SKILL.md`（仓库外独立安装）。
+配套 skill 源码与运行入口已随仓维护，见上方「编排 Skill 源码与待部署包」；源码更新不会替换已安装技能。
 规格基线：上级 research/codex-side-toolkit-spec.md，提交 `0965cfe`。
 
 离线验收：

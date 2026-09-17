@@ -7,7 +7,7 @@
 在已确认 DSH 目标 ID 的终端中运行。以下 `$sessionId` 必须先赋值为真实目标；首次也可使用已核验的 dshq 别名。
 
 ```powershell
-function dshq { & node 'D:\git\DHS-Tool\bridge-mcp\cli\dshq.mjs' @args }
+function dshq { & node '<本技能目录>/scripts/dshq.mjs' @args }
 dshq monitor run wave-1 $sessionId --max-min 60
 ```
 

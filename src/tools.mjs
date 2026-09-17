@@ -48,10 +48,10 @@ export const INSTRUCTIONS = [
   'DSH 外部编排：仅在用户授权范围内派发/发消息。先查 dsh_task_capabilities；模型 ID 从 dsh_task_models 获取。spawn 显式传 cwd、externalRef，串行派发。delivered≠消费，idle/settled≠验收完成；未知目标须报错。反馈采用拉模型：wait 分段等，settled:false 正常；progress 用 cursor 只读增量。写请求超时先对账，勿盲目重发。',
   '1) 派发用 dsh_task_spawn 串行进行——桥侧策略闸限制滚动 60s 窗口内最多 10 次 spawn，超限返回 429 policy-gated（附 retryAfterMs）：读 retryAfterMs 等待后再重试，串行派发天然低触发。spawn 回执必读 workspace/placement/modelSource：ungrouped/worktree 落位（含 warning）须先补救或确认接受；模型路线不符预期立即停止并纠正。',
   '2) 反馈一律拉取（reportBack 已结构性关闭）：用 dsh_task_wait 分段等待（timeoutMs 默认 45000、上限 50000；settled:false 是正常心跳而非错误，续 call 即可），配合 dsh_task_progress 读 recent 尾部/todos/goal/agentState 判断进展。禁止高频轮询轰炸：wait 长轮询本身就是等待，progress 仅在 wait 返回 settled 或需要决策时读取。',
-  '3) 纠偏用 dsh_task_send：目标运行中用 mode=steer（下一生效步骤生效）；空闲目标或追加上下文用默认 queue。回执 queueDepth.nextTurn>=2 表示该消息约 2 轮后才被读——改用 steer 或先等一轮，避免晚一步白干一步。',
-  '4) 工具返回 isError:true 时读 code 与 error 字段并按 skills/dsh-task-bridge/SKILL.md 错误码处置表行动。spawn 返回 upstream-error 且信封含孤儿 sessionId（upstreamCode 为 model-select-failed/kickoff-rejected）时该会话已存在：用 dsh_task_send 补发开场消息，或放弃并让总控处置。',
+  '3) 纠偏用 dsh_task_send：只有需要改变运行中目标下一步时用 mode=steer；普通补充或交接用 queue。投递位置不证明模型已消费。queueDepth 只表示待处理队列长度，不保证消费轮数；不要为改变队列位置重复发送同一消息。',
+  '4) 工具返回 isError:true 时读 code 与 error 字段并按 skills/dsh-task-bridge/SKILL.md 错误码处置表行动。spawn 返回 upstream-error 且信封含孤儿 sessionId（upstreamCode 为 model-select-failed/kickoff-rejected）时该会话已存在：先核对模型路线和开场是否接收，再在授权内决定补发或交总控处置，不能重复 spawn。',
   '5) 派发前不确定模型路线就先调 dsh_task_models 查合法 provider/model id——绝不猜 id。',
-  '6) 换会话后先用 dsh_task_list（可带 team 过滤）重建指挥上下文。',
+  '6) 换会话后先恢复已确认的事项与完整目标 ID；身份或归属不明确时才用 dsh_task_list（可带 team 过滤）核对，不靠标题猜测。',
 ].join('\n');
 
 export const TOOLS = [
@@ -101,11 +101,11 @@ export const TOOLS = [
     description:
       '向既有任务会话投递消息（POST /v1/send）。参数：sessionId（必填，目标会话 id）；' +
       'message（必填，消息正文：纠偏指令、补充上下文或交接信息）；' +
-      'mode（可选：queue=下一轮开始时投递（默认，目标运行中排队/空闲即开新轮）；steer=运行中目标在当前轮的下一生效步骤立即生效——用于停止/纠偏/冲突警告等需要立刻改变下一步的场景）；' +
+      'mode（可选：queue=下一轮开始时投递（默认，目标运行中排队/空闲即开新轮）；steer=运行中目标在当前轮的可用步骤边界投递——用于停止/纠偏/冲突警告等需要立刻改变下一步的场景）；' +
       'reference（可选，引用早前回执的 messageId 或 spawn 的 correlationId，用于可追溯的纠偏链）。' +
       '成功回执字段：delivered（是否已投递）、targetId、mode（实际投递模式）、messageId（可被后续 send 的 reference 引用）、' +
-      'queueDepth（{nextTurn,nextStep}，投递后口径含本条；nextTurn>=2 意味着约 2 轮后才被读——考虑改 steer）、' +
-      'placement（next-step=mid-run steering 已生效 / next-turn=已排队）、targetStatus（running/idle）、' +
+      'queueDepth（{nextTurn,nextStep}，投递后口径含本条；仅表示队列长度，不保证具体消费轮数）、' +
+      'placement（next-step=进入步骤间投递位置 / next-turn=进入下一轮队列；均不证明已执行）、targetStatus（running/idle）、' +
       'note（冷目标投递的注意事项，如有）。' +
       '失败 code 常见：rate-limited（429，附 retryAfterMs，等够时间再发；含上游 target-busy）、queue-full（429，队列已满先等消费）、' +
       'not-found（404，upstreamCode=target-not-found/target-vanished：id 错误或会话已结束）、bad-request（400）。' +
