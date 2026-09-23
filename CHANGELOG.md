@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1] - 2026-09-23
+
+### outputSchema 全覆盖 + 重定向到合并后桥
+
+- 七个 dsh_task_* 工具全部补 outputSchema（云端工具面板与模型侧可据 schema 理解返回结构；inputSchema 原有不动）。stdio/cli 双传输自洽验证 51/51 全绿。
+- DSH 侧重定向说明：服务端现为 dsh-plugin-task-coordinator ≥0.27.0——独立包 dsh-plugin-task-bridge 已合并内置并标 DEPRECATED（其仓 0.3.1）。wire 契约冻结未变，本包代码零协议改动；README 补 DEPRECATED 指向与合并后拓扑（ChatGPT 网页 → OpenAI Secure MCP Tunnel → 本包 → 合并后桥）。实测合并硬切换时本包零改动存活、tunnel-client 无需重启。
+- 发版：git tag v0.4.1（tag 为唯一发布号；package.json = MCP serverInfo = CLI banner 已随 0.4.1 对齐）。
+
 ## [0.4.0] - 2026-09-18
 
 ### 收编正式化（0918 总控）
