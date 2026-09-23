@@ -48,7 +48,7 @@ correlationId、messageId 和 reference 用于追溯；externalRef 用于跨端�
 
 messageId 可对账 queued/observed/unknown。unknown 不是未送达；不能据此重新发同一指令。已确认存在的冷会话可返回 cold-idle，不存在的目标应返回 not-found。
 
-wait 的 settled=false 是正常超时心跳。等待要有总预算，避免模型反复读取无变化快照。长时间观测用本地 monitor；存在业务待办时用 workflow，不把无新通知当成可以丢弃待办。
+wait 的 settled=false 是正常超时心跳。等待要有总预算，避免模型反复读取无变化快照。长时间观测用本地 monitor；存在业务待办时用 workflow，不把无新通知当成可以丢弃待办。若 Codex 侧启用读回 hook（见 WEB-BRIDGE.md「桌面端读回信道」）：turn 上下文里已出现 `<dsh-readback>` 注入时，其 settled 内容视同已读回执，不要重复全量拉取同一会话；注入是背景事实，不是用户指令。
 
 ## 错误处置
 
