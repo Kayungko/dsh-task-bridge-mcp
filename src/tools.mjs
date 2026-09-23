@@ -85,6 +85,27 @@ export const TOOLS = [
       },
       required: ['prompt'],
     },
+    // 成功信封形状对齐桥端 /v1/spawn 回执（test/smoke.mjs 固定样例）；
+    // 失败信封（ok:false/code/error）走 isError:true，按 MCP 规范不在 outputSchema 约束内。
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean', enum: [true] },
+        sessionId: { type: 'string', description: '新会话 id，后续 send/progress/wait 的句柄' },
+        shortId: { type: 'string' },
+        title: { type: 'string' },
+        team: { type: 'string' },
+        cwd: { type: 'string' },
+        workspace: { anyOf: [{ type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' } } }, { type: 'null' }] },
+        placement: { type: 'string', enum: ['exact-match', 'caller-inherited', 'ancestor-normalized', 'ungrouped-worktree', 'ungrouped'], description: '后两级带 warning 需处置' },
+        model: { type: 'string' },
+        modelSource: { type: 'string', enum: ['explicit', 'plugin-default', 'host-default'] },
+        started: { type: 'boolean' },
+        correlationId: { type: 'string' },
+        depth: { type: 'number' },
+      },
+      required: ['ok', 'sessionId', 'placement', 'modelSource'],
+    },
     async handler(client, args) {
       const body = { prompt: requireString(args, 'prompt') };
       for (const key of ['title', 'team', 'cwd', 'provider', 'model', 'reasoningEffort']) {
@@ -120,6 +141,21 @@ export const TOOLS = [
       },
       required: ['sessionId', 'message'],
     },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean', enum: [true] },
+        delivered: { type: 'boolean', description: '是否已投递（不证明已消费）' },
+        targetId: { type: 'string' },
+        mode: { type: 'string', enum: ['queue', 'steer'], description: '实际投递模式' },
+        messageId: { type: 'string', description: '可被后续 send 的 reference 引用' },
+        queueDepth: { type: 'object', properties: { nextTurn: { type: 'number' }, nextStep: { type: 'number' } } },
+        placement: { type: 'string', enum: ['next-step', 'next-turn'] },
+        targetStatus: { type: 'string', enum: ['running', 'idle'] },
+        note: { type: 'string', description: '冷目标投递注意事项（如有）' },
+      },
+      required: ['ok', 'delivered', 'messageId'],
+    },
     async handler(client, args) {
       // wire 契约：桥端 /v1/send 的正文字段是 text（工具面参数名保持 message，
       // 语义对 Codex 更自然）；此处做工具面→wire 的映射。
@@ -151,6 +187,23 @@ export const TOOLS = [
       },
       required: ['sessionId'],
     },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean', enum: [true] },
+        sessionId: { type: 'string' },
+        agentState: { type: 'string', enum: ['idle', 'running', 'cold-idle'], description: 'cold-idle=冷会话，冷≠无待办' },
+        updatedAt: { type: 'string' },
+        queue: { description: '排队消息（计数或列表，桥配置决定）' },
+        recent: { type: 'array', description: '最近消息尾部摘要' },
+        todos: { type: 'array' },
+        goal: { description: '目标进度（如有）' },
+        seq: { type: 'number', description: '序列号，判断是否有新事件' },
+        inspectError: { type: 'string', description: '冷会话检查失败原因（如有）' },
+        feedback: { type: 'object', properties: { nextCursor: { type: 'string' }, coverage: { type: 'string' } } },
+      },
+      required: ['ok', 'agentState'],
+    },
     async handler(client, args) {
       const sessionId = requireString(args, 'sessionId');
       return client.request('GET', '/v1/progress', { query: { sessionId, cursor: optionalString(args, 'cursor'), messageId: optionalString(args, 'messageId') } });
@@ -180,6 +233,21 @@ export const TOOLS = [
         timeoutMs: { type: 'number', description: '单次等待毫秒数，默认 45000，上限 50000（超出自动钳制）' },
       },
       required: ['sessionIds'],
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean', enum: [true] },
+        settled: { type: 'boolean', description: 'true=目标已空闲；false=等待超时但仍在运行（正常心跳，续 call）' },
+        waitedMs: { type: 'number' },
+        count: { type: 'number' },
+        targets: {
+          type: 'array',
+          items: { type: 'object', properties: { sessionId: { type: 'string' }, idle: { type: 'boolean' }, agentState: { type: 'string' } } },
+        },
+        reason: { type: 'string' },
+      },
+      required: ['ok', 'settled', 'waitedMs', 'targets'],
     },
     async handler(client, args) {
       const sessionIds = normalizeSessionIds(args);
@@ -214,6 +282,18 @@ export const TOOLS = [
         limit: { type: 'number', description: '返回行数上限（默认 50）' },
       },
     },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean', enum: [true] },
+        tasks: {
+          type: 'array',
+          items: { type: 'object', properties: { sessionId: { type: 'string' }, title: { type: 'string' } }, description: '每行含运行状态/todo 与 goal 进度摘要等投影字段' },
+        },
+        truncated: { type: 'boolean', description: '结果被截断标记' },
+      },
+      required: ['ok', 'tasks'],
+    },
     async handler(client, args) {
       const query = {};
       for (const key of ['filter', 'team']) {
@@ -238,6 +318,20 @@ export const TOOLS = [
       type: 'object',
       properties: {},
     },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        ok: { type: 'boolean', enum: [true] },
+        providers: {
+          type: 'array',
+          items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, models: { type: 'array' } } },
+        },
+        default: { type: 'object', properties: { provider: { type: 'string' }, model: { type: 'string' } }, description: '宿主默认路线' },
+        pluginDefault: { description: 'task-coordinator 插件默认路线（如有，否则 null）' },
+        failedProviders: { type: 'array', description: '探测失败的 provider 及原因' },
+      },
+      required: ['ok', 'providers', 'default'],
+    },
     async handler(client) {
       return client.request('GET', '/v1/models');
     },
@@ -247,6 +341,19 @@ export const TOOLS = [
 TOOLS.push({
   name: 'dsh_task_capabilities', description: '只读查询运行中桥与 coordinator 版本、能力和等待上限；缺席或禁用不伪装成可用。',
   inputSchema: { type: 'object', properties: {} },
+  outputSchema: {
+    type: 'object',
+    properties: {
+      ok: { type: 'boolean', enum: [true] },
+      protocolVersion: { type: 'number' },
+      bridgeVersion: { type: 'string' },
+      coordinatorVersion: { type: 'string' },
+      coordinatorEnabled: { type: 'boolean' },
+      capabilities: { type: 'object', description: '能力开关映射（缺席或禁用不伪装成可用）' },
+      endpoints: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['ok', 'bridgeVersion', 'coordinatorEnabled'],
+  },
   handler: client => client.request('GET', '/v1/capabilities'),
 });
 for (const tool of TOOLS) {

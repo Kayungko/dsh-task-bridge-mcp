@@ -1,5 +1,11 @@
 # dsh-task-bridge-mcp
 
+> **安装前提（0.27.0 起）**：宿主侧桥端点已合并进 `dsh-plugin-task-coordinator`
+> ≥0.27.0，需在「设置 → 任务编排」打开实验开关 `bridgeEnabled` 后，本 wrapper
+> 才有 127.0.0.1:43120 的七个路由可连（设计与冻结契约见
+> `research/bridge-merge-into-coordinator-design.md`）。旧独立包
+> `dsh-plugin-task-bridge` 已 DEPRECATED。
+
 Codex 侧 MCP stdio wrapper：把 [dsh-plugin-task-bridge](../bridge)（DSH Desktop 的
 Codex→DSH 控制面桥接插件）的 REST 端点包装成 Codex 可调用的 MCP 工具。
 

@@ -94,7 +94,7 @@ export function handleRpcMessage(msg, ctx) {
       return jsonRpcResult(id, {});
     case 'tools/list':
       return jsonRpcResult(id, {
-        tools: TOOLS.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, annotations })),
+        tools: TOOLS.map(({ name, description, inputSchema, outputSchema, annotations }) => ({ name, description, inputSchema, outputSchema, annotations })),
       });
     case 'tools/call': {
       const name = params?.name;

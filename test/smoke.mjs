@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,7 @@ import { BridgeClient, resolveToken, TokenError, BridgeClientError, BridgeApiErr
 import { TOOLS, INSTRUCTIONS, WAIT_MAX_MS, WAIT_DEFAULT_MS } from '../src/tools.mjs';
 
 const testDir = dirname(fileURLToPath(import.meta.url)); // <repo>/test
+const pkgVersion = JSON.parse(readFileSync(join(testDir, '..', 'package.json'), 'utf8')).version;
 const repoDir = join(testDir, '..');
 
 // ---------- 合成假值（绝不读取真实 token） ----------
@@ -360,7 +361,7 @@ test('JSON-RPC 协议分支：initialize / tools/list / notifications / ping / �
   );
   assert.equal(init.result.protocolVersion, '2025-06-18');
   assert.equal(init.result.serverInfo.name, 'dsh-task-bridge-mcp');
-  assert.equal(init.result.serverInfo.version, '0.4.0'); // 0.4.0 起 serverInfo 随 package.json（评审 P2-1 版本轨道收敛）
+  assert.equal(init.result.serverInfo.version, pkgVersion); // 0.4.0 起 serverInfo 随 package.json（评审 P2-1 版本轨道收敛）；断言动态读取防 bump 漂移
   assert.ok(init.result.instructions.length > 200, 'instructions 必须载拉模型纪律');
   for (const kw of ['拉', '串行', 'policy-gated', 'retryAfterMs', 'settled:false', 'queueDepth', 'progress', 'dsh_task_models']) {
     assert.ok(INSTRUCTIONS.includes(kw), `instructions 须覆盖纪律关键词：${kw}`);
