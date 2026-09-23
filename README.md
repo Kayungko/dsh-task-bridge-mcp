@@ -1,19 +1,27 @@
 # dsh-task-bridge-mcp
 
 > **安装前提（0.27.0 起）**：宿主侧桥端点已合并进 `dsh-plugin-task-coordinator`
-> ≥0.27.0，需在「设置 → 任务编排」打开实验开关 `bridgeEnabled` 后，本 wrapper
-> 才有 127.0.0.1:43120 的七个路由可连（设计与冻结契约见
-> `research/bridge-merge-into-coordinator-design.md`）。旧独立包
-> `dsh-plugin-task-bridge` 已 DEPRECATED。
+> ≥0.27.0，需在「设置 → 任务编排 → 外部任务桥」打开实验开关 `bridgeEnabled` 后，本
+> wrapper 才有 127.0.0.1:43120 的七个路由可连。旧独立包 `dsh-plugin-task-bridge`
+> 已 DEPRECATED，**不要再去装它或找它的开关**。桥端 token 文件
+> `~/.dsh/task-bridge-token` 在 coordinator **≥0.27.2 由桥自动生成**；0.27.0/0.27.1
+> 上不会生成，需手工建好，否则七条路由一律回 503。
+>
+> 设计与冻结契约见 `research/bridge-merge-into-coordinator-design.md`（在 DHS-Tool
+> 工作区内，**本仓不含该文件**）。
+> **网页额度（ChatGPT Web）部署 walkthrough**：`dsh-plugin-task-coordinator` 仓的
+> `docs/WEB-BRIDGE.md`（本仓同样不含）——经 OpenAI Secure MCP Tunnel 驱动本机 DSH
+> 的完整三步部署、profile 模板、command 分词规则与排障速查都在那里。
 
-Codex 侧 MCP stdio wrapper：把 [dsh-plugin-task-bridge](../bridge)（DSH Desktop 的
-Codex→DSH 控制面桥接插件）的 REST 端点包装成 Codex 可调用的 MCP 工具。
+Codex 侧 MCP stdio wrapper：把 [dsh-plugin-task-bridge](https://github.com/Kayungko/dsh-plugin-task-bridge)（DSH Desktop 的
+Codex→DSH 控制面桥接插件；现已 DEPRECATED，宿主侧由 `dsh-plugin-task-coordinator` ≥0.27.0 内置接替）的 REST 端点包装成 Codex 可调用的 MCP 工具。
 
 ```
-Codex CLI ──MCP stdio(JSON-RPC)──> dsh-task-bridge-mcp ──HTTP(fetch)──> 桥 /v1/* 端点 ──> DSH task-coordinator ops
+Codex CLI     ──MCP stdio(JSON-RPC)──> dsh-task-bridge-mcp ──HTTP(fetch)──> 桥 /v1/* 端点 ──> DSH task-coordinator ops
+ChatGPT 网页  ──OpenAI Secure MCP Tunnel──> tunnel-client ──MCP stdio──> 本包 ──HTTP(fetch)──> 同上
 ```
 
-- 设计蓝图：[`research/task-bridge-reanchoring.md`](../research/task-bridge-reanchoring.md) §4（MCP stdio wrapper 推荐）+ §3（端点清单与回执字段）。
+- 设计蓝图：`research/task-bridge-reanchoring.md` §4（MCP stdio wrapper 推荐）+ §3（端点清单与回执字段）——在 DHS-Tool 工作区内，本仓不含。
 - **零运行时依赖**（见下方选型说明），Node.js ≥ 18.17（用内置 fetch / AbortController / readline）。
 
 当前源码新增能力查询、MCP/CLI 统一传输及增量反馈，见 [Codex 接入增量契约](docs/codex-integration.md)。运行状态以 capabilities 回执为准。
@@ -53,15 +61,36 @@ MCP stdio 协议面变化时需要手动跟进——对单消费方（Codex CLI�
 
 ```powershell
 # 1. 取得代码（本仓库即代码本体，无需构建步骤）
-git clone <repo> D:\git\DHS-Tool\bridge-mcp   # 或已就位
+git clone https://github.com/Kayungko/dsh-task-bridge-mcp.git
+cd dsh-task-bridge-mcp
 
 # 2. 无依赖可装；如需跑离线测试：
-cd D:\git\DHS-Tool\bridge-mcp
 npm test        # MCP/CLI 离线回归（mock REST server，不依赖真桥）
 ```
 
-运行要求：Node.js ≥ 18.17；DSH Desktop 运行中且 dsh-plugin-task-bridge 已启用
-（真桥 bring-up 后才可用，见「已知限制」）。
+> 下文示例统一用 `<bridge-mcp>` 代表你实际的克隆目录。**克隆路径尽量避开空格与非 ASCII 字符**——tunnel-client 的 `command:` 串按空白切分、且不做变量展开（实测规则见 coordinator 仓 `docs/WEB-BRIDGE.md`）。
+
+### 让 profile 里不出现仓库绝对路径（推荐）
+
+写进 tunnel-client profile 的 `command:` 是绝对路径，仓库一挪就得改。做一次全局安装即可彻底解耦：
+
+```powershell
+npm i -g <bridge-mcp>       # 拷贝安装：仓库移动/重克隆都不影响
+# 或 npm link <bridge-mcp>  # 符号链接：跟随仓库改动（开发态方便，但仓库一挪就断）
+npm root -g                 # 查全局 node_modules 位置
+```
+
+之后 profile 只需写 `command: 'dsh-task-bridge-mcp'`（走 PATH 里的 npm shim，shim 按自身目录相对解析，与仓库位置无关）。若不想依赖 `.cmd` shim，可写 `node <npm root -g 输出>/dsh-task-bridge-mcp/src/server.mjs`——执行链与 clone 形态完全同构，不引入新的失败模式。
+
+> **本包尚未发布到 npm registry**（2026-09-23 核实返回 404），因此 `npx -y dsh-task-bridge-mcp` 今天不可用。`package.json` 的 `bin` 与 `src/server.mjs` 的 shebang 都已就位，发布后即可用；但 `npx -y` 首跑要联网下载解包，会把 MCP 启动从毫秒级拖到秒级、离线即不可用——常驻链路不建议。
+
+运行要求：Node.js ≥ 18.17；DSH Desktop 运行中，且宿主侧桥已开启——**0.27.0 起桥内置于 `dsh-plugin-task-coordinator`**，开关在 **设置 → 任务编排 → 外部任务桥 → 启用外部桥**（热生效，不重启宿主）。旧独立包 `dsh-plugin-task-bridge` 已 DEPRECATED，不要再去装它。桥端 token 文件 `~/.dsh/task-bridge-token` 在 coordinator **≥0.27.2 由桥自动生成**；0.27.0/0.27.1 上不会生成，需手工建好，否则七条路由一律回 503（建法见 coordinator 仓 `docs/WEB-BRIDGE.md`）。
+
+### 路径写法注意（Windows）
+
+- 写进 tunnel-client profile 的 `command:` 时，Windows 路径**必须用正斜杠**，或套 **YAML 单引号**让反斜杠字面存活。反斜杠在引号外与 YAML 双引号内都会被当转义符吃掉（`D:\git\x` → `D:gitx`），而报错只说 "script not found"，不会告诉你是反斜杠的问题。
+- 写进 Codex `config.toml` 的 `args` 时正斜杠同样最稳。
+- 不做 `${VAR}` / `%VAR%` / `~` 展开——全部按字面量传给子进程。
 
 ## Codex 配置（~/.codex/config.toml 片段）
 
@@ -73,12 +102,13 @@ npm test        # MCP/CLI 离线回归（mock REST server，不依赖真桥）
 ```toml
 [mcp_servers.dsh-task-bridge]
 command = "node"
-args = ["D:/git/DHS-Tool/bridge-mcp/src/server.mjs"]
+args = ["<bridge-mcp>/src/server.mjs"]   # 例：C:/tools/dsh-task-bridge-mcp/src/server.mjs —— 正斜杠最稳
 startup_timeout_sec = 10
 tool_timeout_sec = 60          # wrapper 的 wait 工具已按 50s 上限钳制，60s 默认值够用
 
 # token 默认从 C:\Users\<你>\.dsh\task-bridge-token 文件读取（wrapper 内置逻辑），
-# 因此**无需**把 token 写进本文件。仅当需要覆盖时才加 env，例：
+# 因此**无需**把 token 写进本文件。该文件在宿主 coordinator ≥0.27.2 由桥自动生成；
+# 0.27.0/0.27.1 上不会生成，需手工建好，否则七条路由一律回 503。仅当需要覆盖时才加 env，例：
 # env = { TASK_BRIDGE_URL = "http://127.0.0.1:43120",
 #         TASK_BRIDGE_TOKEN_FILE = "D:/somewhere/other-token-file" }
 
@@ -105,7 +135,7 @@ tool_timeout_sec = 60          # wrapper 的 wait 工具已按 50s 上限钳制�
 token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文件路径；
 每次请求前惰性重读（桥重启轮换 token 后无需重启 wrapper）。
 
-## 工具清单（镜像桥 MVP 6 端点）
+## 工具清单（6 业务端点 + 1 只读能力查询 = 7 工具）
 
 桥端点 `cancel` 属第二批（蓝图 §0.2），本版本**不提供** `dsh_task_cancel`
 （调用会得到 JSON-RPC `-32602` Unknown tool）。
@@ -118,6 +148,7 @@ token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文�
 | `dsh_task_wait` | GET `/v1/wait` | `sessionIds`*（单值或数组）；`mode`（all/any）、`timeoutMs`（默认 45000，**钳制 ≤50000**） | `settled`（false=正常心跳，续 call 即可）、`reason`、`waitedMs`、`count`、`targets[]` |
 | `dsh_task_list` | GET `/v1/list` | `filter`/`team`/`includeSubagents`/`ungrouped`/`limit` 全可选 | `tasks[]`、`truncated` |
 | `dsh_task_models` | GET `/v1/models` | 无 | `providers[]`、`default`、`pluginDefault`、`failedProviders` |
+| `dsh_task_capabilities` | GET `/v1/capabilities` | 无 | `ok`、`protocolVersion`、`bridgeVersion`、`coordinatorVersion`、`coordinatorEnabled`、`capabilities`、`endpoints[]`（7 条）、`limits`、`reportBack`、`cwdDefault`。`bridgeVersion` 与宿主插件的 `package.json` 单一版本轨锁步，是判别服务方为合并后新桥的关键值 |
 
 \* 必填。每个工具的 description 内嵌完整的参数与回执字段说明（Codex 端模型可直接读到）。
 
@@ -179,7 +210,7 @@ skills/dsh-task-bridge/SKILL.md   Codex 侧使用纪律（拉模型/策略闸/�
 消费六个业务 REST 端点和只读 capabilities 端点，不修改 MCP 配置或宿主。PowerShell 当前进程可定义：
 
 ```powershell
-function dshq { & node 'D:\git\DHS-Tool\bridge-mcp\cli\dshq.mjs' @args }
+function dshq { & node '<bridge-mcp>\cli\dshq.mjs' @args }
 dshq version
 dshq status
 dshq list --team task-bridge
@@ -211,7 +242,7 @@ CLI 限制为无凭据的回环 HTTP(S) base，禁用重定向；所有输出统
 ```powershell
 dshq find '总控'
 dshq progress 95a2abaf --json
-dshq spawn '只回复一句话后结束回合，不调用工具。' --title '探索｜编排探针' --team dshq-shakedown --cwd 'D:\git\DHS-Tool' --watch
+dshq spawn '只回复一句话后结束回合，不调用工具。' --title '探索｜编排探针' --team dshq-shakedown --cwd '<你的工作区绝对路径>' --watch
 ```
 
 `watch` 每次 wait 默认 45000ms（`--timeout` 可缩短，上限 45000ms），
@@ -248,15 +279,22 @@ node cli/test/smoke.mjs
 mock HTTP 桥覆盖十命令、ID 三态、send.text、八值错误、token 三来源/轮换/脱敏、
 watch 收敛/预算耗尽、策略闸退避和 JSON/进程退出码；不接触真实 token 或真实 DSH 任务。
 
-## 已知限制（以下为原 MCP wrapper 的历史未验证项，非 dshq CLI 验收结论）
+## 已知限制
 
-1. **未与真桥实机联调**：REST 端点形状已按桥端 `D:\git\DHS-Tool\bridge` README
-   （v0.1.0）的端点对照表逐项核对（wire 字段名、参数序列化、回执字段、
-   错误码枚举），并同步了 send 的 `message`→`text` wire 映射；但端到端实机
-   联调（真实宿主 webserver + 真实 token）留待 bring-up 阶段。
-2. **Codex 实机 MCP 挂载未验证**：`config.toml` 字段实际生效行为、`instructions`
-   采用度按官方文档实现（蓝图 §4.2），留待 bring-up 用 `codex mcp list` / TUI `/mcp` 验证。
-3. `dsh_task_cancel` 未提供（桥第二批端点）。
+1. **（历史项，2026-09-23 已实测推翻）未与真桥实机联调**：REST 端点形状曾按桥端
+   `dsh-plugin-task-bridge`（宿主侧现为 `dsh-plugin-task-coordinator` ≥0.27.0）
+   README v0.1.0 的端点对照表逐项核对（wire 字段名、参数序列化、回执字段、错误码
+   枚举），并同步了 send 的 `message`→`text` wire 映射。**端到端实机联调已完成**：
+   ChatGPT 网页 → OpenAI Secure MCP Tunnel → 本包 → 合并后桥的回传，与本地直连
+   43120 逐字段一致；0.27.0 独立包硬切换时本包零改动存活、tunnel-client 无需重启
+   （wire 契约冻结未变）。
+2. **（部分推翻，2026-09-23）Codex 实机 MCP 挂载未验证**：MCP stdio 挂载已在
+   **tunnel-client** 这条真实 stdio 链路上端到端验证（工具可见、可调用、`instructions`
+   随 initialize 下发、回执与本地直连一致）。但 **Codex CLI 自身的 `config.toml` 形态**
+   （字段实际生效行为、`instructions` 在 Codex 侧的采用度）本轮未重新取证，仍按官方
+   文档实现（蓝图 §4.2）；用 `codex mcp list` / TUI `/mcp` 可自行验证。
+3. `dsh_task_cancel` 未提供（桥第二批端点，蓝图 §0.2）——调用会得到 JSON-RPC
+   `-32602` Unknown tool。**此项仍成立。**
 
 ## 许可
 

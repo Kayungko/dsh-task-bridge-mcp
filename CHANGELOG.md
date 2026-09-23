@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### 部署文档修正（分发友好性）+ 包元数据补齐
+
+- README 安装节去掉作者开发机绝对路径（`D:\git\DHS-Tool\bridge-mcp`），改真实 clone URL + `<bridge-mcp>` 占位；其余同类路径（Codex `config.toml` 的 `args`、`dshq` 函数、`--cwd` 示例、「已知限制」里的桥端引用）一并中性化。
+- 运行要求修正为与 0.27.0 合并后的事实一致：宿主侧桥内置于 `dsh-plugin-task-coordinator`，开关在「设置 → 任务编排 → 外部任务桥 → 启用外部桥」——原文仍写「dsh-plugin-task-bridge 已启用」，与本文件自己的头部注记矛盾，会让用户去找一个已不存在的插件。
+- 新增「让 profile 里不出现仓库绝对路径」节：`npm i -g` 后 profile 可只写 `dsh-task-bridge-mcp`（PATH shim 按自身目录相对解析），消除仓库搬家导致的 profile 失效；并记录 `npx -y dsh-task-bridge-mcp` 当前不可用（registry 404）与其冷启动/离线隐患。
+- 新增「路径写法注意」：Windows 路径必须用正斜杠或套 YAML 单引号——反斜杠在引号外与 YAML 双引号内都被当转义符吃掉（`D:\git\x` → `D:gitx`），而报错只说 script not found；不做 `${VAR}`/`%VAR%`/`~` 展开。实测于 tunnel-client v0.0.14。
+- 兑现 0.4.1 声称但当时未落地的内容：拓扑图补 ChatGPT 网页 → Secure MCP Tunnel → tunnel-client → 本包一行；头部注记补指向 coordinator 仓 `docs/WEB-BRIDGE.md` 的网页部署 walkthrough 入口。
+- 跨仓相对链接改绝对 URL 或标注「本仓不含」：`../bridge`、`../research/*` 在独立 clone 形态下全部 404（本仓 `git ls-tree` 无 `bridge/`、无 `research/`）。
+- 工具清单标题「镜像桥 MVP 6 端点」改为「6 业务端点 + 1 只读能力查询 = 7 工具」，表格补 `dsh_task_capabilities` 行；回执字段按活体 `/v1/capabilities` 实测填写（`ok`/`protocolVersion`/`bridgeVersion`/`coordinatorVersion`/`coordinatorEnabled`/`capabilities`/`endpoints[]`/`limits`/`reportBack`/`cwdDefault`）。
+- 「已知限制」按 2026-09-23 实测结果重新标注：第 1 条（未与真桥实机联调）已推翻；第 2 条**部分**推翻——tunnel-client stdio 链路已端到端验证，但 Codex CLI 自身 `config.toml` 形态本轮未重新取证，措辞如实区分。第 3 条（无 `dsh_task_cancel`）仍成立。
+- 包元数据补齐以备发布：新增 `LICENSE`（MIT，与 `package.json` 声明对齐——此前声明 MIT 但仓库无该文件）与 `repository` 字段。`bin` 与 `src/server.mjs` 的 shebang 经核实齐备；npm 发包仍阻塞于本机未登录（`ENEEDAUTH`）。
+- 无代码行为改动；自洽验证 51/51 全绿。
+
 ## [0.4.1] - 2026-09-23
 
 ### outputSchema 全覆盖 + 重定向到合并后桥
