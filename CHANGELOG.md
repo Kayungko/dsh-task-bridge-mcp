@@ -1,6 +1,35 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] - 2026-09-24
+
+### 新增：本地文件与命令工具（`local_*`，默认关闭）
+
+动机：`dsh_task_*` 是任务编排——重活由 DSH 会话里的 agent 干，消耗 DSH 侧模型额度、秒级到分钟级、只能拿到尾部摘要（默认 6 条消息）。网页侧「查个代码、读个配置」这类需求走这条路既慢又贵。本版补上另一条路：`local_*` 工具**直接操作本机**，不经 DSH 任务会话，因此零模型额度、毫秒级、返回文件原文。两种模式并存，由调用方按需选择（对齐 WebCodex 同类能力面）。
+
+- 新增 `src/local-fs.mjs`（纯模块，零依赖，fs 与 spawn 均可注入以便离线单测）与 5 个工具：`local_read_file`（带行号 `cat -n` 风格 + `offset`/`limit` 分页）、`local_write_file`（overwrite/append，父目录递归创建，回执含 `existed`/`previousSize`/`newSize`）、`local_list_dir`（可递归、跳过隐藏目录、无权限子目录静默跳过）、`local_grep`（JS 正则，跳过 `node_modules`/`.git`/`dist`/`build`/`coverage` 与二进制/超限大文件）、`local_exec`（本机 shell）。全部带 input/outputSchema。
+- **env 双独立门控，默认全关**：`DSH_BRIDGE_LOCAL_FS=1` 开文件四件套，`DSH_BRIDGE_LOCAL_EXEC=1` 另开 shell。只认字面 `'1'`（`'true'`/`'yes'` 不算启用）。都不设时 `tools/list` 仍是原 7 个、`initialize` 的 instructions 不提本地工具、stderr 无横幅——既有链路逐字节零变化。env 只在进程启动时读一次，不支持热切换（能力面在进程生命周期内固定，避免"跑着跑着多出个 shell 工具"）。
+- `instructions` 按启用集合动态拼接：只开文件时不提 `local_exec`，避免诱导模型调用未注册的工具。
+- 启用时 stderr 打横幅，把实际生效的能力面与上限写进 tunnel-client 日志（运维可见性）。
+- **四层内置防护**（不是可选项）：① 默认关闭 + 双独立开关；② 本链路凭据（`~/.dsh/task-bridge-token` 或 `TASK_BRIDGE_TOKEN_FILE` 指向的路径、`~/.dsh/.credentials.yaml`）**强制不可读写且不可配置解除**——读走等于凭据永久留在云端对话记录里，属自毁而非能力；拒绝时不回吐任何文件内容；③ 默认凭据保护（`~/.ssh`/`~/.aws`/`~/.azure`/`~/.gnupg`/`~/.kube` 整棵树 + `.env`/`.env.*`/私钥/`*.pem`/`credentials.*`/`kubeconfig`/`netrc`/`pgpass`/`npmrc`/`pypirc` 类文件名），可用 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0` 显式解除、解除时启动打强告警；④ 写与执行每次都写 stderr 审计行（路径 / 命令原文 / 退出码），**绝不记文件内容与命令输出**。另有 `DSH_BRIDGE_FS_DENY` 追加黑名单（按目录前缀匹配）。
+- 有界性：读取与 exec 输出共享 `DSH_BRIDGE_FS_MAX_BYTES`（默认 256KB，与桥 body 上限同量级）；`local_grep` 有文件数（2000）与深度（12）上限，超限置 `truncated` 如实报告不静默截断；二进制文件（前 8KB 内含 NUL）拒绝返回内容并指向 `local_exec`；大文件读取拒绝并提示分页。
+- 风险在工具 description 里对模型明说（写操作无人在环、`local_exec` 是风险最高的工具、破坏性命令须先确认、优先用 read/grep 而非 cat/findstr），因为网页侧没有 DSH 那层确认闸门。
+
+### 修复：`local_exec` 超时杀不掉进程树（Windows）
+
+实测发现 `spawn` 的 `timeout` 选项与单纯 `child.kill()` 在 Windows + `shell:true` 下都不可靠：直接子进程是 shell（`cmd.exe`），真正的命令是它的孙进程，杀了 shell 孙进程照跑，`close` 事件要等孙进程 stdio 全关才触发——**500ms 的超时实测等满脚本的 30s**，超时期望完全落空，生产上会撞穿 MCP `tool_timeout_sec`（表现成"整个会话卡死"）。
+
+- 改为模块内 `setTimeout` + `taskkill /pid <pid> /T /F`（Windows，走参数数组而非命令串以免多一层 shell 二次解析）/ `kill -9 -<pgid>`（POSIX）终止整棵进程树；实测 781ms 内收口，taskkill 报告杀掉 shell + 2 个孙进程。
+- 另监听 `exit` 作为兜底（250ms 缓冲让已收数据落地）：宁可少几个尾字节，也不能让工具调用永久挂起。
+- `timedOut` 改用显式标志判定，不再依赖 `signal === 'SIGTERM'|'SIGKILL'`（Windows 上被 `taskkill /F` 杀时退出码与信号都不可靠）。
+
+### 修复：exec 收口后 stdio 句柄泄漏
+
+被 taskkill 终止的进程树仍留有管道句柄，不显式释放则持有者（本进程）的 event loop 要等到句柄自然关闭。实测 500ms 超时 + 30s 脚本时，宿主进程多活满 30s；测试 runner 的 `duration_ms` 从 1135ms 的实际测试耗时虚高到 30350ms。**常驻 server 上这就是每次 exec 超时泄漏一个句柄**。修法：收口时 `destroy()` 两条 stdio 流（幂等，已关闭时抛错被吞掉）。修复后同一场景 842ms 收口，全套测试 `duration_ms` 30430ms → 2064ms。
+
+### 验证
+
+- 离线单测：新增 `test/local-fs.test.mjs` 48 例（门控组合、五个工具正常路径、三级凭据保护与解除、NUL 拒绝、黑名单、大小上限、二进制拒绝、分页、grep 跳过规则、审计日志内容与脱敏、超时/退出码/输出超限/cwd、server 层分发与 `LocalToolError` → `isError:true` 的 code 透传），含 3 个专钉上述两个 bug 的回归用例（stdio 必须 destroy、exit 必须能兜底收口、不得再依赖 spawn 的 timeout 选项）。全套 **102/102** 全绿（原 51 + 新 51）。
+- **真机活体端到端**：真 spawn `node src/server.mjs` 走真 stdio JSON-RPC，四场景 32 项断言全过——A 默认关闭（7 工具、无 `local_*`、instructions 不提、stderr 无横幅）；B 只开文件（11 工具、无 `local_exec`、调它回 `-32602`、真读文件与真 grep 命中）；C 全开（12 工具、token 文件被拒且不回吐内容、write→read 往返、`local_exec` 真跑通 `6*7=42`、非零退出码如实报 `exit=4`、**桥侧 `dsh_task_capabilities` 仍打通 43120 且 7 条路由齐全**）；D 解除默认保护（`.env` 可读 + 启动强告警 + 桥 token 仍强制不可读）。
 
 ### 部署文档修正（分发友好性）+ 包元数据补齐
 
@@ -13,7 +42,8 @@
 - 工具清单标题「镜像桥 MVP 6 端点」改为「6 业务端点 + 1 只读能力查询 = 7 工具」，表格补 `dsh_task_capabilities` 行；回执字段按活体 `/v1/capabilities` 实测填写（`ok`/`protocolVersion`/`bridgeVersion`/`coordinatorVersion`/`coordinatorEnabled`/`capabilities`/`endpoints[]`/`limits`/`reportBack`/`cwdDefault`）。
 - 「已知限制」按 2026-09-23 实测结果重新标注：第 1 条（未与真桥实机联调）已推翻；第 2 条**部分**推翻——tunnel-client stdio 链路已端到端验证，但 Codex CLI 自身 `config.toml` 形态本轮未重新取证，措辞如实区分。第 3 条（无 `dsh_task_cancel`）仍成立。
 - 包元数据补齐以备发布：新增 `LICENSE`（MIT，与 `package.json` 声明对齐——此前声明 MIT 但仓库无该文件）与 `repository` 字段。`bin` 与 `src/server.mjs` 的 shebang 经核实齐备；npm 发包仍阻塞于本机未登录（`ENEEDAUTH`）。
-- 无代码行为改动；自洽验证 51/51 全绿。
+- 环境变量表补 9 个 `DSH_BRIDGE_*` 变量；安全注意事项补本地工具的凭据自保护与审计留痕两条。
+- 桥侧 wire 契约零改动：7 条 `/v1/*` 路由、`X-Task-Bridge-Token`、token 路径、信封形状全部冻结未动，本地工具不经桥。
 
 ## [0.4.1] - 2026-09-23
 

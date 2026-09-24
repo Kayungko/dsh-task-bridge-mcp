@@ -131,9 +131,26 @@ tool_timeout_sec = 60          # wrapper 的 wait 工具已按 50s 上限钳制�
 | `TASK_BRIDGE_URL` | 桥 REST base URL | `http://127.0.0.1:43120` |
 | `TASK_BRIDGE_TOKEN` | 桥鉴权 token（明文值，优先级最高） | 不设置 |
 | `TASK_BRIDGE_TOKEN_FILE` | token 文件路径 | `C:\Users\<你>\.dsh\task-bridge-token` |
+| `DSH_BRIDGE_LOCAL_FS` | `=1` 启用 4 个本地文件工具（见下节） | **不启用** |
+| `DSH_BRIDGE_LOCAL_EXEC` | `=1` 另启用 `local_exec`（本机 shell） | **不启用** |
+| `DSH_BRIDGE_FS_MAX_BYTES` | 单次读取 / exec 输出字节上限 | `262144`（256KB） |
+| `DSH_BRIDGE_EXEC_TIMEOUT_MS` | `local_exec` 超时上限（入参只能调小不能调大） | `30000` |
+| `DSH_BRIDGE_GREP_MAX_FILES` | `local_grep` 扫描文件数上限 | `2000` |
+| `DSH_BRIDGE_GREP_MAX_DEPTH` | `local_grep` / 递归列举深度上限 | `12` |
+| `DSH_BRIDGE_LOCAL_CWD` | 本地工具的缺省工作目录 | bridge-mcp 进程 cwd |
+| `DSH_BRIDGE_FS_DENY` | 追加路径黑名单（`path.delimiter` 分隔，按目录前缀匹配） | 不设置 |
+| `DSH_BRIDGE_FS_DENY_CREDENTIALS` | `=0` 解除默认凭据保护（启动打强告警） | 保护开启 |
 
 token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文件路径；
 每次请求前惰性重读（桥重启轮换 token 后无需重启 wrapper）。
+
+**所有 env 都在进程启动时读一次，不支持热切换**——改开关必须重启 bridge-mcp（经 tunnel-client
+部署时即重启 tunnel-client）。这是有意的：能力面在进程生命周期内固定，避免"跑着跑着多出个
+shell 工具"。启用时 stderr 会打一条横幅，便于在 tunnel-client 日志里确认实际生效的能力面：
+
+```
+[bridge-mcp] local tools ENABLED: local_read_file, local_write_file, local_list_dir, local_grep (maxBytes=262144, execTimeoutMs=30000, denyCredentials=true, cwd=…)
+```
 
 ## 工具清单（6 业务端点 + 1 只读能力查询 = 7 工具）
 
@@ -175,6 +192,82 @@ token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文�
 `bridge-invalid-response` / `invalid-params` / `internal-error`。
 完整处置表见 [`skills/dsh-task-bridge/SKILL.md`](skills/dsh-task-bridge/SKILL.md)。
 
+## 本地文件与命令工具（0.5.0，默认关闭）
+
+上面的 7 个 `dsh_task_*` 工具是**任务编排**：网页/Codex 侧派活，重活由 DSH 会话里的 agent
+执行，消耗的是 **DSH 侧模型额度**。本节这 5 个 `local_*` 工具是另一条路：**直接操作本机**，
+不经 DSH 任务会话，因此**不消耗任何模型额度**、毫秒级返回、拿到的是文件原文而非摘要。
+
+两种模式并存，由调用方按需选择：
+
+| | `dsh_task_*`（任务编排） | `local_*`（直接操作本机） |
+|---|---|---|
+| 谁干活 | DSH 会话里的 agent | bridge-mcp 进程自己 |
+| 额度 | 消耗 DSH 侧模型额度 | **零模型额度** |
+| 延迟 | 秒级到分钟级（要等 agent 跑） | 毫秒级 |
+| 拿到的 | agent 的转述 + 尾部摘要（默认 6 条消息） | 文件原文 / 命令原始输出 |
+| 人在环 | 有（DSH 确认闸门、用户在场） | **没有** |
+| 适合 | 需要推理、改多处、跑测试的开发任务 | 查代码、读配置、看日志、跑一条命令 |
+
+**默认一个都不注册**：不设 `DSH_BRIDGE_LOCAL_FS` / `DSH_BRIDGE_LOCAL_EXEC` 时 `tools/list`
+仍是原来 7 个，既有链路逐字节零变化。两者是独立开关，「只开文件、不开 shell」是常见且更稳
+的形态。
+
+| 工具 | 开关 | 参数 | 说明 |
+|---|---|---|---|
+| `local_read_file` | `LOCAL_FS` | `path`*、`offset`、`limit` | 读文本文件，返回带行号内容（`cat -n` 风格）+ `totalLines`/`truncatedByLimit`。超 `MAX_BYTES` 拒绝并提示分页；含 NUL 的二进制拒绝返回内容 |
+| `local_write_file` | `LOCAL_FS` | `path`*、`content`*、`mode` | `overwrite`（默认）/ `append`；父目录缺失时递归创建。回执含 `existed`/`previousSize`/`newSize`，便于确认是新建还是覆盖 |
+| `local_list_dir` | `LOCAL_FS` | `path`*、`recursive`、`limit` | 默认单层；递归时跳过隐藏目录且有深度上限。无权限的子目录静默跳过，不让整次列举失败 |
+| `local_grep` | `LOCAL_FS` | `pattern`*、`path`、`caseInsensitive`、`onlyMatching`、`limit` | JS 正则（非 ripgrep）。自动跳过 `node_modules`/`.git`/`dist`/`build`/`coverage`、隐藏目录、二进制与超限大文件；回执含 `filesScanned`/`truncated` |
+| `local_exec` | `LOCAL_EXEC` | `command`*、`cwd`、`timeoutMs` | 本机 shell。回执含 `exitCode`/`signal`/`timedOut`/`outputTruncated`/`stdout`/`stderr` |
+
+\* 必填。每个工具的 description 内嵌完整参数、回执与风险说明（模型可直接读到）。
+
+### ⚠️ 这组工具的风险定位（启用前务必读）
+
+`local_*` 把**本机文件系统与 shell 暴露给一个云端模型会话**，且网页侧没有人在环的确认闸门。
+提示注入（模型读到的任何外部内容都可能是载体——网页内容、文件内容、命令输出）可直接指挥它
+读写文件、执行命令。与 `dsh_task_*` 的最坏情况（"派了个任务"，有 DSH 确认闸门兜底）不同，
+这里的最坏情况是"仓库被改、命令被执行、文件被读走"。
+
+因此实现内置了四层防护，**不是可选项**：
+
+1. **默认关闭 + 两个独立开关**：不显式 opt-in 就一个工具都不注册。
+2. **本链路凭据强制不可读写**：`~/.dsh/task-bridge-token`（或 `TASK_BRIDGE_TOKEN_FILE`
+   指向的路径）与 `~/.dsh/.credentials.yaml` 一律拒绝，**且不可通过任何配置解除**。
+   理由：读走它们等于凭据永久留在云端对话记录里，属自毁而非能力。拒绝时不回吐任何文件内容。
+3. **默认凭据保护**（可用 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0` 显式解除，解除时启动打强告警）：
+   `~/.ssh`、`~/.aws`、`~/.azure`、`~/.gnupg`、`~/.kube` 整棵树，以及 `.env`/`.env.*`、
+   `id_rsa`/`id_ed25519`、`*.pem`/`*.p12`/`*.pfx`/`*.key`、`credentials.json|yaml`、
+   `kubeconfig`/`netrc`/`pgpass`/`npmrc`/`pypirc` 类文件名。
+4. **写与执行每次都写审计日志**（stderr，tunnel-client 日志会收）：
+   `AUDIT local_write_file path=… mode=… existed=… previousSize=… newSize=…`、
+   `AUDIT local_exec cwd=… timeoutMs=… exit=… timedOut=… command=…`。
+   记路径与命令原文（都不是秘密），**绝不记文件内容与命令输出**（可能含敏感数据）。
+
+启用建议：
+
+- 只开 `LOCAL_FS`、不开 `LOCAL_EXEC`，先用 `local_read_file`/`local_grep` 满足"网页侧查代码"
+  的绝大部分需求——这两者不需要 shell。
+- 写操作只在 git 工作树内进行，写完立刻 `git diff` 复核。
+- 用 `DSH_BRIDGE_FS_DENY` 把不想被碰的目录显式拉黑（按目录前缀匹配，子文件一并拒绝）。
+- 要开 `LOCAL_EXEC` 就想清楚：`command` 经 shell 解释（Windows 上是 `cmd.exe`），
+  `& | ^ < >` 等都是元字符、不做转义；破坏性命令（`rm`/`del`/`format`/`git push --force`/
+  `git reset --hard`）模型被要求必须先向用户确认，但那是**纪律而非机械闸**。
+
+### 有界性（避免一次调用拖死链路）
+
+- 读取与 exec 输出共享 `DSH_BRIDGE_FS_MAX_BYTES`（默认 256KB）；exec 输出超限即杀进程树并置
+  `outputTruncated`。
+- `local_exec` 超时由模块内定时器实现，到点用 `taskkill /T /F`（Windows）/ `kill -9 -<pgid>`
+  （POSIX）**终止整棵进程树**。不能只靠 `child.kill()`：`shell:true` 下直接子进程是 shell，
+  杀了它孙进程仍持有 stdout 管道，`close` 事件永不触发（实测 500ms 超时变成等满脚本的 30s）。
+  收口时显式 `destroy()` 两条 stdio 流，否则宿主进程会悬挂到子进程自然退出——常驻 server 上
+  这就是句柄泄漏。
+- 另监听 `exit` 作为兜底（250ms 缓冲让已收数据落地）：宁可少几个尾字节，也不能让工具调用永久
+  挂起（那会撞穿 MCP `tool_timeout_sec`，表现成"整个会话卡死"）。
+- `local_grep` 有文件数与深度上限，超限置 `truncated` 如实报告，不静默截断。
+
 ## 安全注意事项
 
 - **token 不进 argv**：鉴权 token 只经环境变量或 token 文件注入，绝不出现在命令行参数
@@ -186,6 +279,12 @@ token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文�
 - **回环限定**：默认 base URL 为 `127.0.0.1:43120`；桥侧另有回环自检（蓝图 §2.4）。
 - **测试脱敏**：仓库内测试与文档的 token 一律为合成假值（`FAKE-TOKEN-*`），
   绝不读取真实 token 文件内容。
+- **本地工具的凭据自保护**：启用 `local_*` 后，桥自己的 token 文件与宿主
+  `.credentials.yaml` 仍**强制不可读写**（不可配置解除）——否则网页会话能把凭据读进云端
+  对话记录。默认另保护 `~/.ssh`、`.env`、私钥类路径；详见「本地文件与命令工具」节。
+- **本地工具的审计留痕**：`local_write_file` 与 `local_exec` 每次调用都写 stderr 审计行
+  （路径 / 命令原文 / 退出码），不含文件内容与命令输出。经 tunnel-client 部署时这些行会落进
+  它的日志文件，事后可追溯网页侧动过什么。
 
 ## 开发与测试
 

@@ -9,12 +9,37 @@ import { createInterface } from 'node:readline';
 import { readFileSync } from 'node:fs';
 import { BridgeClient, TokenError, BridgeClientError, BridgeApiError, DEFAULT_BASE_URL } from './client.mjs';
 import { TOOLS, INSTRUCTIONS, ToolValidationError } from './tools.mjs';
+import { buildLocalTools, buildLocalInstructions, resolveLocalConfig, LocalToolError } from './local-fs.mjs';
 
 const SUPPORTED_PROTOCOL_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18'];
 const LATEST_PROTOCOL_VERSION = '2025-06-18';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const SERVER_INFO = { name: pkg.name, version: pkg.version };
+
+/**
+ * 本地文件/命令工具（0.5.0）：默认关闭。env DSH_BRIDGE_LOCAL_FS=1 开文件四件套、
+ * DSH_BRIDGE_LOCAL_EXEC=1 另开 local_exec——两个独立开关，只开文件不开 shell 是常见
+ * 且更稳的形态。都不设时 LOCAL_TOOLS 为空数组，既有 7 工具链路**逐字节零变化**。
+ *
+ * 进程启动时读一次 env（不支持热切换：改开关必须重启 bridge-mcp / tunnel-client）。
+ * 这是有意的——能力面在进程生命周期内固定，避免"跑着跑着多出个 shell 工具"。
+ */
+const LOCAL_CONFIG = resolveLocalConfig();
+const LOCAL_TOOLS = buildLocalTools({ config: LOCAL_CONFIG });
+/** 全部工具：桥侧 7 个（冻结契约）+ 本地若干（门控）。分发与 tools/list 共用同一数组。 */
+const ALL_TOOLS = [...TOOLS, ...LOCAL_TOOLS];
+/** instructions 同样按启用集合动态拼接，未启用就不提本地工具（不诱导模型去调不存在的工具）。 */
+const ALL_INSTRUCTIONS = [INSTRUCTIONS, ...buildLocalInstructions(LOCAL_CONFIG)].join('\n');
+
+if (LOCAL_TOOLS.length > 0) {
+  // 运维可见性：这个进程开了什么能力必须能在 tunnel-client 日志里一眼看到。
+  process.stderr.write(
+    `[bridge-mcp] local tools ENABLED: ${LOCAL_TOOLS.map((t) => t.name).join(', ')} `
+    + `(maxBytes=${LOCAL_CONFIG.maxBytes}, execTimeoutMs=${LOCAL_CONFIG.execTimeoutMs}, `
+    + `denyCredentials=${LOCAL_CONFIG.denyCredentials}, cwd=${LOCAL_CONFIG.defaultCwd})\n`,
+  );
+}
 
 function jsonRpcError(id, code, message) {
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
@@ -40,6 +65,9 @@ function errorToToolResult(err) {
   } else if (err instanceof BridgeClientError) {
     code = err.code; // bridge-unreachable / bridge-timeout / bridge-http-error / bridge-invalid-response
     error = err.message;
+  } else if (err instanceof LocalToolError) {
+    code = err.code; // invalid-params / not-found / too-large / binary-file / credential-protected / path-denied / exec-failed / is-directory / not-directory
+    error = err.message;
   } else {
     code = 'internal-error';
     error = 'dsh-task-bridge-mcp 内部错误';
@@ -62,6 +90,10 @@ function errorToToolResult(err) {
  * @returns {object|null} 响应消息（写入 stdout），通知或无需响应时返回 null。
  */
 export function handleRpcMessage(msg, ctx) {
+  // ctx 可覆盖 tools/instructions，供离线单测断言不同 env 门控组合下的工具面；
+  // 生产路径不传，落到模块级 ALL_TOOLS / ALL_INSTRUCTIONS。
+  const tools = ctx?.tools ?? ALL_TOOLS;
+  const instructions = ctx?.instructions ?? ALL_INSTRUCTIONS;
   if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
     // MCP stdio 不使用 JSON-RPC batch；畸形输入无法可靠取 id，按规范回 id:null。
     return jsonRpcError(null, -32600, 'Invalid Request');
@@ -79,7 +111,7 @@ export function handleRpcMessage(msg, ctx) {
         protocolVersion,
         capabilities: { tools: {} },
         serverInfo: SERVER_INFO,
-        instructions: INSTRUCTIONS,
+        instructions,
       });
     }
     case 'notifications/cancelled':
@@ -94,11 +126,11 @@ export function handleRpcMessage(msg, ctx) {
       return jsonRpcResult(id, {});
     case 'tools/list':
       return jsonRpcResult(id, {
-        tools: TOOLS.map(({ name, description, inputSchema, outputSchema, annotations }) => ({ name, description, inputSchema, outputSchema, annotations })),
+        tools: tools.map(({ name, description, inputSchema, outputSchema, annotations }) => ({ name, description, inputSchema, outputSchema, annotations })),
       });
     case 'tools/call': {
       const name = params?.name;
-      const tool = TOOLS.find((t) => t.name === name);
+      const tool = tools.find((t) => t.name === name);
       if (!tool) {
         return jsonRpcError(id, -32602, `Unknown tool: ${name}`);
       }
