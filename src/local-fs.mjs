@@ -19,11 +19,23 @@ import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFile
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 
 /** read / exec 输出的默认字节上限（与桥 body 上限 256KB 同量级）。 */
 export const DEFAULT_MAX_BYTES = 256 * 1024;
 /** exec 默认超时（对齐 Codex tool_timeout_sec 默认 60s 的一半，留出 MCP 序列化余量）。 */
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
+/**
+ * `local_exec` 默认并发上限（0.5.2，`DSH_BRIDGE_EXEC_MAX_CONCURRENT`）。
+ *
+ * 0.5.1 之前没有任何并发闸：云端会话可以一次发起任意多条命令，每条都可能跑满
+ * `execTimeoutMs`。后果是本机 CPU/句柄被打满、而 bridge-mcp 与隧道都要陪着扛——
+ * 这既是资源问题也是可用性问题（同一进程还服务着 7 个桥工具）。
+ * 超限**直接报错**而不是静默排队：排队会让调用方以为命令在跑，实际什么都没发生，
+ * 而且队列本身又是新的无界资源。
+ */
+export const DEFAULT_EXEC_MAX_CONCURRENT = 4;
 /** grep 默认扫描文件数上限（零依赖遍历，必须有界，否则大目录会拖死）。 */
 export const DEFAULT_GREP_MAX_FILES = 2_000;
 /** grep 默认递归深度上限。 */
@@ -34,6 +46,46 @@ export const MAX_LIST_ENTRIES = 5_000;
 /** grep 默认/最大命中数（同上，clamp 后回执才真正有界）。 */
 export const DEFAULT_GREP_MATCHES = 100;
 export const MAX_GREP_MATCHES = 5_000;
+/**
+ * grep 整次调用的墙上时间预算（0.5.2 新增，`DSH_BRIDGE_GREP_TIMEOUT_MS`）。
+ *
+ * 为什么 grep 需要一个**总时间**上界，而不只是文件数/深度上界：正则的灾难性回溯
+ * 与文件数无关，一个 33 字符的输入配一条 `(a+)+$` 就能让单线程 event loop 冻住——
+ * 实测本机（Node v24.13.1）该模式与 `(x+x+)+y` 都跑过 15s 需外部 taskkill 才收场。
+ * bridge-mcp 是常驻 stdio server，event loop 一冻，**7 个桥工具一起不可用**，而
+ * 0.5.1 之前这条路径上没有任何时间控制（`limit` 只管命中数，管不到回溯）。
+ */
+export const DEFAULT_GREP_TIMEOUT_MS = 10_000;
+/**
+ * 传给 `vm` 的单次 timeout 下限。`vm` 的 `timeout` 不是「<=0 即无限」那么宽容的语义，
+ * 而且预算耗尽时传 0/负数毫无意义——所以剩余预算低于此值时**直接停止遍历**并如实上报，
+ * 绝不把非法值交给 vm。
+ */
+const MIN_VM_SLICE_MS = 25;
+
+/**
+ * 单文件匹配脚本（在 vm context 内执行）。
+ *
+ * ⚠️ 脚本文本是**写死的**；不可信的 `pattern` / `lines` / `flags` 只作为 contextified
+ * sandbox 上的数据属性进入，绝不做字符串插值。实测把 `")); process.exit(1); ("`
+ * 当 pattern 传进去，得到的只是 `Invalid regular expression`，不会执行任何代码。
+ * 命中片段一律切到 500 字符——0.5.1 的 onlyMatching 分支不切，一条命中就能带回
+ * 整行（压缩后的单行 JS 可达 maxBytes 量级），×maxMatches 就是几十 MB 的回执。
+ */
+const GREP_SCAN_SCRIPT = `
+JSON.stringify((function () {
+  var re = new RegExp(pattern, flags);
+  var hits = [];
+  for (var i = 0; i < lines.length; i += 1) {
+    var line = lines[i];
+    if (!re.test(line)) continue;
+    var frag = onlyMatching ? String((line.match(re) || [''])[0]) : line;
+    hits.push([i + 1, frag.length > 500 ? frag.slice(0, 500) : frag]);
+    if (hits.length >= maxHits) break;
+  }
+  return { hits: hits, hitCap: hits.length >= maxHits };
+})())
+`;
 
 /**
  * exec 传给子进程的环境变量白名单（0.5.1）。
@@ -207,14 +259,46 @@ export function protectedAlways(env = process.env) {
  *
  * `.dsh` 整棵树在 0.5.1 加入：它除两个强制保护文件外还有 `settings.yaml`、`sessions/`、
  * `storages/`、`profiles/`（安全评审判定这些同样不该被云端会话读走）。
+ *
+ * 0.5.2 补漏：0.5.1 的清单是「凭直觉列的常见项」，安全评审逐条核对后指出它漏掉了多个
+ * **本机真实存在**的凭据位置——`.codex/auth.json`（Codex CLI）、`.config/gh/hosts.yml`
+ * （GitHub CLI token）、`.git-credentials`、`.docker/config.json`、shell history（人手粘贴
+ * 过 token 的地方）、浏览器 `Login Data`。这些既不在目录清单里，文件名也不匹配任何模式，
+ * 于是网页会话一条 `local_read_file` 就能读走。以下每一项都对应一个真实的凭据存储位置。
+ *
+ * 目录项是**相对 home 的路径**，可以含分隔符（`.config/gh`）；`join` 会按平台归一。
  */
-export const PROTECTED_DIRS = ['.ssh', '.aws', '.azure', '.gnupg', '.kube', '.dsh'];
+export const PROTECTED_DIRS = [
+  '.ssh', '.aws', '.azure', '.gnupg', '.kube', '.dsh',
+  '.codex',        // Codex CLI：auth.json（OpenAI API key / OAuth 令牌）
+  '.claude',       // Claude Code：settings.json 可含 env 秘密；projects/ 下是**完整会话转写**
+  '.openviking',   // ov.conf：embedding / vlm / query_planner 的模型端点与凭据配置
+  '.docker',       // Docker：config.json 里的 registry auth
+  '.terraform.d',  // Terraform Cloud token（credentials.tfrc.json）
+  '.config/gh',    // GitHub CLI：hosts.yml 里的 oauth_token
+  '.config/gcloud', // Google Cloud ADC：credentials.db / application_default_credentials.json
+  '.config/rclone', // rclone：rclone.conf 明文存各家对象存储凭据
+  '.config/op',    // 1Password CLI
+];
 export const PROTECTED_NAME_PATTERNS = [
   /^\.env(\..+)?$/i,          // .env / .env.local / .env.production
   /^id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$/i,
-  /\.(pem|p12|pfx|key)$/i,
+  /\.(pem|p12|pfx|key|ppk)$/i, // ppk = PuTTY 私钥（0.5.2 补）
   /(^|[^a-z])credentials?\.(json|ya?ml)$/i,
   /(^|[\\/.])(kubeconfig|netrc|_netrc|pgpass|npmrc|pypirc)$/i,
+  // ---- 0.5.2 补漏 ----
+  /^\.git-credentials$/i,     // git credential store：明文存 https 用户名+密码/token
+  /^auth\.json$/i,            // Codex CLI / Firebase 服务账号
+  /^credentials$/i,           // 无扩展名的凭据文件（RubyGems ~/.gem/credentials 等）
+  /^credentials\.(db|tfrc\.json)$/i, // gcloud 凭据库 / Terraform Cloud token
+  /^secrets?\.(ya?ml|json)$/i, // k8s Secret / helm values 里的秘密清单
+  /^rclone\.conf$/i,          // 不在 ~/.config/rclone 下时也拦住
+  // shell / REPL 历史：人手粘贴过的 token、密码、连接串会长期留在这里
+  /^\.(bash|zsh|sh|ksh|fish|psql|mysql|rediscli|python|node_repl|sqlite)_history$/i,
+  /^\.lesshst$/i,
+  // Chromium 系（Chrome/Edge）：Login Data 是密码库，Local State 存解密密钥
+  /^login data(-journal)?$/i,
+  /^local state$/i,
 ];
 
 /** 判断一个已 canonical 的绝对路径是否落在默认保护范围内。 */
@@ -228,17 +312,76 @@ export function isProtectedByDefault(absPath, home = homedir()) {
   return PROTECTED_NAME_PATTERNS.some((re) => re.test(base));
 }
 
+// ---------------------------------------------------------------------------
+// 自身完整性保护（0.5.2）
+// ---------------------------------------------------------------------------
+
+/** 本模块文件路径，用于推出包根。 */
+const SELF_MODULE_FILE = fileURLToPath(import.meta.url);
+
 /**
- * 统一的路径守卫：canonical 化 + NUL 拒绝 + 三级凭据保护 + 用户追加黑名单。
+ * bridge-mcp 自己的包根目录（canonical 形式）。
  *
- * 三级保护**全部按 canonical 形式比较**，且强制保护与黑名单都做「精确 + 子树」双向匹配：
+ * 布局固定为 `<pkg>/src/local-fs.mjs`，向上两级即包根。这里必须用 `import.meta.url`
+ * 而不是 `process.cwd()`：生产部署下 cwd 是 tunnel-client 的启动目录，与本包位置无关；
+ * 而 profile 的 `command` 直接指向工作树的 `src/server.mjs`——**改写源码会在下次重启后
+ * 被原样加载**，那是一条持久化通道，不是一次性破坏。
+ *
+ * @param {string} [moduleFile] 覆盖用（单测注入）
+ */
+export function selfPackageRoot(moduleFile = SELF_MODULE_FILE) {
+  return canonical(dirname(dirname(moduleFile)));
+}
+
+/**
+ * 写保护清单（canonical）：`local_write_file` 不得改写的路径。
+ *
+ * 只挡**写**、不挡读——本包是公开仓库，源码不是秘密；挡住读只会妨碍正常使用（例如让
+ * 网页侧帮忙看桥的实现），却拦不住任何真实攻击。
+ *
+ * ⚠️ 作用域边界（别把它当万能防护，README 同样写明）：
+ *  - `local_exec` 开着时这层保护**基本无意义**：攻击者有 shell，一条
+ *    `echo > src/local-fs.mjs` 就绕过了，文件级写保护拦不住任意命令执行。
+ *  - 所以它真正防的是「只开 LOCAL_FS、不开 shell」这个更窄配置下的**持久化改写**——
+ *    没有 shell 时 write_file 是唯一能改动本包源码的通道。
+ *  - 审计文件也在清单内且**不可解除**：审计是这条链路对外宣称的唯一补偿性控制，
+ *    一次 write_file 就能截断清零的审计不构成控制。
+ */
+export function writeProtectedPaths({ env = process.env, selfRoot = selfPackageRoot(), auditFile = null } = {}) {
+  const out = [];
+  // 两项都必须 canonical：guardPath 拿来比的 `abs` 是 canonical 形式（Windows 下小写、
+  // 剥 ADS、解析真实路径），清单里只要有一侧是原始大小写就**永不相等**，保护静默失效。
+  // selfPackageRoot() 自己返回 canonical，所以默认路径没问题；但注入路径（单测、或将来
+  // 从配置读入的包位置）不是——0.5.1 的 guardWalkEntry 就栽在同一个坑上（入参没 canonical
+  // 导致 DSH_BRIDGE_FS_DENY 在递归遍历里完全不生效），这是该错误的第二次复发。
+  if (auditFile) {
+    out.push({ path: canonical(auditFile), overridable: false, why: '审计日志文件（截断它等于销毁这条链路唯一的操作留痕）' });
+  }
+  if (selfRoot && env.DSH_BRIDGE_FS_ALLOW_SELF_WRITE !== '1') {
+    out.push({ path: canonical(selfRoot), overridable: true, why: 'bridge-mcp 自身包目录（改写其源码会在下次进程重启后被加载，构成持久化）' });
+  }
+  return out;
+}
+
+/**
+ * 统一的路径守卫：canonical 化 + NUL 拒绝 + 三级凭据保护 + 用户追加黑名单 + 自身完整性。
+ *
+ * 三级凭据保护**全部按 canonical 形式比较**，且强制保护与黑名单都做「精确 + 子树」双向匹配：
  *  - 候选在保护项子树内 → 拒绝（防把受保护目录当搜索根 / 读其子文件）
  *  - 保护项在候选子树内 → 同样拒绝（防把 `~/.dsh` 当根去 grep 出里面的 token；
  *    这是 0.5.0 被实测击穿的最短路径：一次 `local_grep(path=父目录)` 即读出凭据原文）
  *
+ * 0.5.2 追加第四级「自身完整性」，**只作用于 op==='write'**：见 writeProtectedPaths。
+ *
  * @returns {string} canonical 后的绝对路径
  */
-export function guardPath(rawPath, { env = process.env, op = 'read', home = homedir() } = {}) {
+export function guardPath(rawPath, {
+  env = process.env,
+  op = 'read',
+  home = homedir(),
+  selfRoot = selfPackageRoot(),
+  auditFile = null,
+} = {}) {
   if (typeof rawPath !== 'string' || !rawPath.trim()) {
     throw new LocalToolError('invalid-params', '参数 path 缺失或不是非空字符串');
   }
@@ -247,6 +390,20 @@ export function guardPath(rawPath, { env = process.env, op = 'read', home = home
   }
   const abs = canonical(rawPath);
   const verb = op === 'read' ? '读取' : op === 'exec' ? '以该路径为工作目录' : '写入';
+
+  // 第零级（0.5.2）：白名单模式。放在最前面有两个理由：
+  //  ① 它是最具体的拒绝原因（「不在你授权的范围内」比「这是凭据文件」信息量更少，
+  //     顺带避免向云端会话泄露「那个位置确实存在一个受保护文件」）；
+  //  ② 它是 AND 条件而非替代——通过白名单之后，下面三级保护照旧全部执行。
+  const allowed = allowRoots(env);
+  if (allowed && !withinAllowList(abs, allowed)) {
+    throw new LocalToolError(
+      'path-not-allowed',
+      `拒绝${verb}该路径：DSH_BRIDGE_FS_ALLOW 白名单模式已启用，而该路径不在任何允许的根目录内。`
+      + `当前允许 ${allowed.length} 个根。白名单只收窄访问范围，不会解除凭据保护。`,
+    );
+  }
+
   // 第一级：强制保护，不可解除。匹配「精确 + 候选落在保护项子树内」两种。
   //
   // 刻意**不**匹配反向（保护项落在候选子树内 → 拒绝该候选）：那会让任何*包含*受保护文件的
@@ -284,6 +441,23 @@ export function guardPath(rawPath, { env = process.env, op = 'read', home = home
       }
     }
   }
+  // 第四级（0.5.2）：自身完整性，**只挡写**。读放行——本包是公开仓库，源码不是秘密。
+  // 生产 profile 直接跑工作树，改写 src/*.mjs 会在下次重启后被加载，所以这是持久化通道。
+  // 注意作用域边界：local_exec 开着时攻击者有 shell，这层保护拦不住 `echo > src/...`；
+  // 它真正防的是「只开文件不开 shell」配置下 write_file 这条唯一通道。
+  if (op === 'write') {
+    for (const item of writeProtectedPaths({ env, selfRoot, auditFile })) {
+      if (abs === item.path || withinTree(abs, item.path)) {
+        throw new LocalToolError(
+          'self-write-protected',
+          `拒绝写入该路径：它落在${item.why}内。`
+          + (item.overridable
+            ? '如确需从网页侧改写本包源码，启动 bridge-mcp 时设 DSH_BRIDGE_FS_ALLOW_SELF_WRITE=1 解除（会在日志留强告警）；更稳妥的做法是在本机编辑器里改、看过 diff 再重启。'
+            : '此项保护不可通过配置解除。'),
+        );
+      }
+    }
+  }
   // 回执用 displayPath（保留 OS 正确大小写），比较用 canonical（小写 + 剥 ADS + 解析真实路径）。
   // Windows 文件系统不区分大小写，所以对小写形式再跑一次 realpathSync.native 能拿回正确大小写。
   return displayPath(abs);
@@ -307,6 +481,10 @@ export function guardWalkEntry(absPath, { env = process.env, home = homedir() } 
   // displayPath（保留 OS 正确大小写）拼出来的，而保护清单是 canonical（Windows 下小写）。
   // 0.5.1 初版漏了这一步，导致 DSH_BRIDGE_FS_DENY 黑名单在递归遍历里**完全不生效**。
   const p = canonical(absPath);
+  // 白名单同样必须在**遍历内**逐条目检查（0.5.2）。这正是 0.5.0 递归绕过教训的同一条纪律：
+  // 只在搜索根上生效的约束，等于对递归发现的文件完全不生效——而一次 grep 就能把整棵树读出来。
+  const allowed = allowRoots(env);
+  if (allowed && !withinAllowList(p, allowed)) return null;
   for (const denied of protectedAlways(env)) {
     if (p === denied || withinTree(p, denied)) return null;
   }
@@ -336,8 +514,12 @@ export function resolveLocalConfig(env = process.env) {
     execEnabled: env.DSH_BRIDGE_LOCAL_EXEC === '1',
     maxBytes: positiveInt(env.DSH_BRIDGE_FS_MAX_BYTES, DEFAULT_MAX_BYTES),
     execTimeoutMs: positiveInt(env.DSH_BRIDGE_EXEC_TIMEOUT_MS, DEFAULT_EXEC_TIMEOUT_MS),
+    /** 同时在跑的 local_exec 上限；超限直接报 exec-busy，不静默排队。 */
+    execMaxConcurrent: positiveInt(env.DSH_BRIDGE_EXEC_MAX_CONCURRENT, DEFAULT_EXEC_MAX_CONCURRENT),
     grepMaxFiles: positiveInt(env.DSH_BRIDGE_GREP_MAX_FILES, DEFAULT_GREP_MAX_FILES),
     grepMaxDepth: positiveInt(env.DSH_BRIDGE_GREP_MAX_DEPTH, DEFAULT_GREP_MAX_DEPTH),
+    /** grep 整次调用的墙上时间预算；到点即停并如实上报，不让一条正则冻住 server。 */
+    grepTimeoutMs: positiveInt(env.DSH_BRIDGE_GREP_TIMEOUT_MS, DEFAULT_GREP_TIMEOUT_MS),
     denyCredentials: env.DSH_BRIDGE_FS_DENY_CREDENTIALS !== '0',
     defaultCwd: typeof env.DSH_BRIDGE_LOCAL_CWD === 'string' && env.DSH_BRIDGE_LOCAL_CWD.trim()
       ? resolve(env.DSH_BRIDGE_LOCAL_CWD.trim())
@@ -397,8 +579,58 @@ function sliceBytes(text, maxBytes) {
 }
 
 /**
+ * 审计字段编码（0.5.2）：把自由文本编成**单行且可无歧义解析**的带引号形式。
+ *
+ * 缺陷：0.5.1 的 AUDIT 行是 `key=value` 直接拼接，而 `command` 与 `path` 都是调用方
+ * 可控的自由文本。命令里带一个换行就能伪造任意多条审计行——例如
+ * `command` 为 `dir` + LF + `AUDIT local_exec ... exit=0 ... command=rm -rf /`，
+ * 事后取证时会看到一条从未发生过的记录，或一条被抹掉的记录。审计是这条链路对外宣称的
+ * **唯一**补偿性控制（网页侧无人在环），可伪造即等于没有这个控制。
+ *
+ * 转义 `\\ " CR LF TAB` 后加双引号，结果正好是合法的 JSON 字符串体，`JSON.parse`
+ * 能直接还原原文——格式对机器和人都确定。代价是 Windows 路径的反斜杠会翻倍
+ * （`d:\\git\\...`），人眼仍可读。
+ */
+const AUDIT_ESCAPES = { '\\': '\\\\', '"': '\\"', '\r': '\\r', '\n': '\\n', '\t': '\\t' };
+export function auditField(value) {
+  return `"${String(value ?? '').replace(/[\\\"\r\n\t]/g, (c) => AUDIT_ESCAPES[c])}"`;
+}
+
+/**
+ * 白名单根（0.5.2，`DSH_BRIDGE_FS_ALLOW`）。
+ *
+ * 0.5.1 只有黑名单：用户无法把网页侧的文件访问**收窄到单个项目目录**，只能在
+ * 「全盘可读」与「逐个拉黑」之间二选一，而后者永远列不全。
+ *
+ * 语义（三条，缺一不可）：
+ *  1. 未设或解析后为空 → 返回 `null`，表示白名单模式未启用，行为与 0.5.1 完全一致；
+ *  2. 启用后，所有 fs 操作的路径与 exec 的 cwd 都必须落在某个根的子树内；
+ *  3. **白名单只收窄、永不放宽**——它是与三级保护的 AND 关系，不是替代。
+ *     落在白名单内的凭据路径照样被拒；否则「把 home 加进白名单」就等于一键解除
+ *     全部凭据保护，那是把这个开关变成了自毁按钮。
+ *
+ * 分隔符用 `path.delimiter`（Windows `;` / POSIX `:`），与 `DSH_BRIDGE_FS_DENY` 一致。
+ *
+ * @returns {string[]|null} canonical 形式的根数组；未启用返回 null
+ */
+export function allowRoots(env = process.env) {
+  const raw = env.DSH_BRIDGE_FS_ALLOW;
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const roots = raw.split(delimiter)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((p) => canonical(p));
+  return roots.length > 0 ? roots : null;
+}
+
+/** 路径是否落在任一白名单根内（两侧都必须已 canonical）。 */
+function withinAllowList(absCanonical, roots) {
+  return roots.some((r) => absCanonical === r || withinTree(absCanonical, r));
+}
+
+/**
  * 造五个本地工具。fs / spawnFn / logger 均可注入以便离线单测。
- * @param {{ env?: NodeJS.ProcessEnv, fs?: object, spawnFn?: Function, logger?: {info?:Function,warn?:Function}, config?: object }} [deps]
+ * @param {{ env?: NodeJS.ProcessEnv, fs?: object, spawnFn?: Function, logger?: {info?:Function,warn?:Function}, config?: object, selfRoot?: string }} [deps]
  */
 export function createLocalTools(deps = {}) {
   const env = deps.env ?? process.env;
@@ -421,21 +653,59 @@ export function createLocalTools(deps = {}) {
     }
   };
   const logger = deps.logger ?? {
-    info: (m) => {
-      process.stderr.write(`[bridge-mcp] ${m}\n`);
-      if (m.startsWith('AUDIT ')) auditSink(m);
-    },
+    info: (m) => { process.stderr.write(`[bridge-mcp] ${m}\n`); },
     warn: (m) => process.stderr.write(`[bridge-mcp] WARN ${m}\n`),
   };
-  const guard = (p, op) => guardPath(p, { env, op });
+  /**
+   * 审计发射的**唯一**入口：既走 logger，也走落盘 sink。
+   *
+   * 0.5.1 把 `auditSink` 挂在**默认 logger** 的 `info` 里，于是任何注入了 logger 的调用方
+   * 都会静默丢掉落盘审计——而审计是这条链路对外宣称的唯一补偿性控制（网页侧无人在环），
+   * 它不该因为依赖注入方式不同而消失。0.5.2 起审计与 logger 解耦：无论 logger 是否被注入，
+   * 只要设了 `DSH_BRIDGE_AUDIT_FILE` 就一定落盘。
+   *
+   * 所有 AUDIT 行必须经此函数发出，不要再直接调 `logger.info`（那会重新丢掉落盘）。
+   */
+  const audit = (line) => {
+    logger.info(line);
+    auditSink(line);
+  };
+  // 自身包根：默认按本模块位置推出（`<pkg>/src/local-fs.mjs` 上溯两级）；可注入以便单测
+  // 断言写保护边界，而不必去动真实包目录。
+  const selfRoot = deps.selfRoot ?? selfPackageRoot();
+  const guard = (p, op) => guardPath(p, { env, op, selfRoot, auditFile: config.auditFile });
   // 递归遍历的逐条目守卫（不抛错，返回 null 即跳过）。0.5.1 修复：0.5.0 只在根上 guard，
   // walk 内部对发现的文件从不检查，于是一次 local_grep(path=父目录) 就能读出
   // ~/.dsh/task-bridge-token、.env、*.pem 的原文——三层保护形同虚设，且零测试覆盖。
   const guardEntry = (p) => guardWalkEntry(p, { env });
 
-  // 解除默认凭据保护时留强告警：这是不可逆的风险放大，必须在日志里可见。
+  // local_exec 并发计数（0.5.2）。递增/递减与检查都在同步代码里完成，JS 单线程下
+  // 「检查 → 占位」之间不可能插入另一次调用，所以不需要锁。
+  let execInFlight = 0;
+
+  // 平台与信号发送函数可注入（0.5.2）。
+  //
+  // 为什么要这个 seam：POSIX 的进程组终止分支（detached:true + kill(-pid)）在 Windows 上
+  // 是**死代码**，而本机装不了 WSL 分发版去实测它——`wsl.exe -l -v` 返回「没有已安装的分发版」。
+  // 0.5.1 只对它做了代码审查就写进了发布说明，那属于「未验证却读起来像已验证」。
+  // 有了 seam，至少能把**代码路径**钉住：用的是 `-pid`（进程组）而不是 `pid`、信号是 SIGKILL、
+  // 兜底 kill 仍然执行、detached 确实传给了 spawn。这把「未测死代码」降级为
+  // 「分支已测、Linux 内核语义仍未验证」——后者是可以如实写进文档的。
+  const platform = deps.platform ?? process.platform;
+  const killFn = deps.killFn ?? ((pid, signal) => process.kill(pid, signal));
+
+  // 解除保护时留强告警：这些是不可逆的风险放大，必须在日志里可见。
   if (config.fsEnabled && !config.denyCredentials) {
-    logger.warn('DSH_BRIDGE_FS_DENY_CREDENTIALS=0 —— 默认凭据保护已解除：网页会话可读取 ~/.ssh、.env、私钥等。仅在你明确知道后果时保留此设置。');
+    logger.warn('DSH_BRIDGE_FS_DENY_CREDENTIALS=0 —— 默认凭据保护已解除：网页会话可读取 ~/.ssh、~/.codex/auth.json、~/.config/gh/hosts.yml、~/.docker/config.json、.env、私钥、shell history、浏览器密码库等。仅在你明确知道后果时保留此设置。');
+  }
+  if (config.fsEnabled && env.DSH_BRIDGE_FS_ALLOW_SELF_WRITE === '1') {
+    logger.warn('DSH_BRIDGE_FS_ALLOW_SELF_WRITE=1 —— 自身完整性保护已解除：网页会话可改写 bridge-mcp 自己的源码，而生产 profile 直接跑工作树，改动会在下次进程重启后被原样加载（持久化通道）。');
+  }
+  // 白名单模式启动即声明生效范围：这是个**收窄**开关，操作者应当能在日志里确认它真的生效了，
+  // 以及它拦不住什么（否则容易误以为设了白名单就等于安全）。
+  if ((config.fsEnabled || config.execEnabled) && allowRoots(env)) {
+    const roots = allowRoots(env);
+    logger.info(`DSH_BRIDGE_FS_ALLOW 白名单已启用：文件工具与 local_exec 的 cwd 被限制在 ${roots.length} 个根目录内。注意两点——白名单不解除任何凭据保护（AND 关系），且它管不住 local_exec 命令里用绝对路径访问的文件（要真正收窄请只开 LOCAL_FS 不开 shell）。`);
   }
 
   return {
@@ -515,7 +785,7 @@ export function createLocalTools(deps = {}) {
       // 于是「写已落盘但 stat 抛错（EACCES / 并发删除 / EIO）」时审计行 0 条、回执退化成
       // internal-error——文件被改了却无痕，直接违反「每次写都留审计」这条声称的机械控制。
       const intendedBytes = Buffer.byteLength(args.content, 'utf8');
-      logger.info(`AUDIT local_write_file path=${abs} mode=${mode} existed=${existed} previousSize=${previousSize} writtenBytes=${intendedBytes}`);
+      audit(`AUDIT local_write_file path=${auditField(abs)} mode=${mode} existed=${existed} previousSize=${previousSize} writtenBytes=${intendedBytes}`);
 
       let st = null;
       try {
@@ -587,13 +857,16 @@ export function createLocalTools(deps = {}) {
       };
     },
 
-    /** 内容正则搜索（零依赖遍历，有文件数与深度上限）。 */
+    /** 内容正则搜索（零依赖遍历，有文件数、深度与**墙上时间**三重上限）。 */
     grep(args = {}) {
       const pattern = typeof args.pattern === 'string' ? args.pattern : '';
       if (!pattern.trim()) throw new LocalToolError('invalid-params', '参数 pattern 缺失或为空');
-      let re;
+      const flags = args.caseInsensitive === true ? 'i' : '';
+      // 主线程只编译一次用于**尽早报「正则不合法」**（编译是线性的，不会回溯）；
+      // 真正执行匹配一律在 vm 里，因为只有那里能被 timeout 中断。
       try {
-        re = new RegExp(pattern, args.caseInsensitive === true ? 'i' : '');
+        // eslint-disable-next-line no-new -- 仅为验证 pattern 合法，不使用返回值
+        new RegExp(pattern, flags);
       } catch (error) {
         throw new LocalToolError('invalid-params', `正则不合法：${error.message}`);
       }
@@ -608,6 +881,22 @@ export function createLocalTools(deps = {}) {
       let filesScanned = 0;
       let truncated = false;
       let depthLimited = false;
+      // ---- 0.5.2：正则执行的硬时间上界 ----
+      // 一次 grep 一个 context，跨文件复用（实测复用后单次 runInContext 约 0.095ms，
+      // 而 runInNewContext 约 0.43ms；2000 文件量级下差出近 1s）。
+      const ctx = vm.createContext({ pattern, flags, onlyMatching, lines: [], maxHits: 1 });
+      const budgetMs = config.grepTimeoutMs;
+      const startedAt = Date.now();
+      let regexMsUsed = 0;
+      /** 灾难性回溯被 vm 中断（pattern 有问题）——与「树太大跑不完」是两种不同结论，分开报。 */
+      let regexTimedOut = false;
+      /** 整次调用的墙上时间预算耗尽（树太大 / 磁盘太慢）。 */
+      let wallTimedOut = false;
+      let skippedRegexTimeout = 0;
+      /** 任一终止条件成立即停止遍历。 */
+      const aborted = () => truncated || regexTimedOut || wallTimedOut;
+      /** 剩余预算；不足一个合法 vm 时间片就算耗尽。 */
+      const remainingBudget = () => budgetMs - (Date.now() - startedAt);
       // 静默漏报计数器（0.5.1）：0.5.0 把超限/二进制/受保护文件直接 continue，
       // 却仍把它们算进 filesScanned，于是「扫了 N 个文件、只有 1 处命中、truncated:false」
       // 无法区分"确实没有"与"被跳过了"。现在逐项如实报告。
@@ -617,18 +906,52 @@ export function createLocalTools(deps = {}) {
       let skippedUnreadable = 0;
       const skipDirs = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage']);
 
-      /** 在单个文件的文本里搜；命中上限由调用方负责置 truncated。 */
+      /**
+       * 在单个文件的文本里搜；命中上限由本函数置 `truncated`。
+       *
+       * **匹配循环跑在 vm context 里**（0.5.2）。这不是把 vm 当沙箱——Node 文档明确说 vm
+       * 不是安全边界，我也没把它当边界用：脚本文本写死，不可信的 pattern/lines 只作为数据
+       * 进 contextified sandbox。用 vm 只为它的 `timeout`，因为那是 Node 里**唯一能中断正在
+       * 回溯的正则**的同步机制；`child_process`/worker 之外的手段都拦不住一次 `re.test()`。
+       *
+       * 实测依据（本机 Node v24.13.1，`.tmpfiles/redos-probe/`）：
+       *  - `(a+)+$` 对 33 字符输入、`(x+x+)+y` 对 30 字符输入，原生跑过 15s 需外部 taskkill；
+       *  - 同模式放进 `vm.runInContext(..., { timeout: 400 })`，402/404ms 抛
+       *    `Script execution timed out`，抛错后**同一 context 与父进程 JS 均正常**；
+       *  - 指数、多项式、交替重叠、global `exec` 循环四种形状都被成功中断。
+       *
+       * 不选 worker_threads 同样是实测结论：Worker 默认选项下子进程写的 stdout 会**原样出现在
+       * 父进程 stdout 上**（与 `w.stdout` 管道捕获双重投递），而本进程的 stdout 就是 JSON-RPC
+       * 信道——worker 路线会直接撞坏协议。
+       */
       const scanText = (filePath, buf) => {
-        const lines = buf.toString('utf8').split('\n');
-        for (let i = 0; i < lines.length; i += 1) {
-          if (!re.test(lines[i])) continue;
-          matches.push({
-            path: filePath,
-            line: i + 1,
-            text: onlyMatching ? (lines[i].match(re) ?? [])[0] ?? '' : lines[i].slice(0, 500),
-          });
-          if (matches.length >= maxMatches) { truncated = true; return; }
+        const remaining = remainingBudget();
+        if (remaining < MIN_VM_SLICE_MS) { wallTimedOut = true; return; }
+        let raw;
+        const t0 = Date.now();
+        try {
+          ctx.lines = buf.toString('utf8').split('\n');
+          ctx.maxHits = Math.max(1, maxMatches - matches.length);
+          raw = vm.runInContext(GREP_SCAN_SCRIPT, ctx, { timeout: remaining });
+        } catch (error) {
+          const msg = String(error?.message ?? error);
+          if (/timed out/i.test(msg)) {
+            // 中断的是**这一条正则**，不是整个搜索能力：置标志后停止遍历即可，
+            // 灾难性 pattern 在后续任何文件上同样灾难，继续跑只是把预算烧光。
+            regexTimedOut = true;
+            skippedRegexTimeout += 1;
+            return;
+          }
+          // pattern 已在主线程用同一构造验证过，走到这里说明是别的执行期问题
+          throw new LocalToolError('invalid-params', `正则执行失败：${msg.slice(0, 200)}`);
+        } finally {
+          regexMsUsed += Date.now() - t0;
         }
+        const parsed = JSON.parse(raw);
+        for (const hit of parsed.hits) {
+          matches.push({ path: filePath, line: hit[0], text: hit[1] });
+        }
+        if (parsed.hitCap) truncated = true;
       };
 
       /** 单文件读取 + 上限/二进制闸门（目录模式与单文件模式共用，0.5.1 起两者一致）。 */
@@ -656,7 +979,10 @@ export function createLocalTools(deps = {}) {
       };
 
       const walk = (dir, depth) => {
-        if (truncated) return;
+        if (aborted()) return;
+        // 墙上时间预算检查放在遍历侧，而不只放在 scanText 侧：一棵巨大的树可能一个文件都
+        // 没扫（全是目录/超限/二进制），却已经把时间耗在 readdir 与 stat 上。
+        if (remainingBudget() < MIN_VM_SLICE_MS) { wallTimedOut = true; return; }
         let names;
         try {
           names = fsImpl.readdirSync(dir, { withFileTypes: true });
@@ -665,7 +991,7 @@ export function createLocalTools(deps = {}) {
           return;
         }
         for (const ent of names) {
-          if (truncated) return;
+          if (aborted()) return;
           const full = join(dir, ent.name);
           if (ent.isDirectory()) {
             if (skipDirs.has(ent.name) || ent.name.startsWith('.')) continue;
@@ -695,20 +1021,32 @@ export function createLocalTools(deps = {}) {
       } else {
         walk(root, 0);
       }
-      const skippedTotal = skippedOversize + skippedBinary + skippedProtected + skippedUnreadable;
+      const skippedTotal = skippedOversize + skippedBinary + skippedProtected + skippedUnreadable + skippedRegexTimeout;
+      const elapsedMs = Date.now() - startedAt;
+      // 超时与「有跳过」是两类不同结论，note 分开说；超时优先，因为它意味着结果可能严重不完整。
+      const note = regexTimedOut
+        ? `正则在 ${elapsedMs}ms 内未跑完，已被强制中断（预算 ${budgetMs}ms）——该 pattern 极可能存在灾难性回溯（如嵌套量词 (a+)+、重叠交替）。已停止后续遍历，结果严重不完整。请收紧 pattern（去掉嵌套量词、加锚点与字面前缀），或改用更具体的字符串；确需长预算可在启动 bridge-mcp 时设 DSH_BRIDGE_GREP_TIMEOUT_MS。`
+        : wallTimedOut
+          ? `整次搜索在 ${budgetMs}ms 预算内未跑完（已扫 ${filesScanned} 个文件），已停止遍历，结果不完整。请收窄 path 或调大 DSH_BRIDGE_GREP_TIMEOUT_MS。`
+          : skippedTotal > 0
+            ? `有 ${skippedTotal} 个文件/目录被跳过（超限 ${skippedOversize}、二进制 ${skippedBinary}、凭据保护 ${skippedProtected}、不可读 ${skippedUnreadable}、正则中断 ${skippedRegexTimeout}），结果不完整；调大 DSH_BRIDGE_FS_MAX_BYTES 或收窄 path 可改善`
+            : null;
       return {
         ok: true, pattern, root, filesScanned, matchCount: matches.length,
-        // truncated 现在也覆盖「有文件被跳过」——否则调用方无法知道结果不完整
-        truncated: truncated || skippedTotal > 0,
+        // truncated 覆盖「有文件被跳过」与「被时间预算截停」——否则调用方无法知道结果不完整
+        truncated: truncated || skippedTotal > 0 || regexTimedOut || wallTimedOut,
         limitTruncated: truncated,
         depthLimited,
+        regexTimedOut,
+        wallTimedOut,
+        elapsedMs,
+        regexMs: regexMsUsed,
+        grepTimeoutMs: budgetMs,
         skipped: {
           total: skippedTotal, oversize: skippedOversize, binary: skippedBinary,
-          protected: skippedProtected, unreadable: skippedUnreadable,
+          protected: skippedProtected, unreadable: skippedUnreadable, regexTimeout: skippedRegexTimeout,
         },
-        ...(skippedTotal > 0
-          ? { note: `有 ${skippedTotal} 个文件/目录被跳过（超限 ${skippedOversize}、二进制 ${skippedBinary}、凭据保护 ${skippedProtected}、不可读 ${skippedUnreadable}），结果不完整；调大 DSH_BRIDGE_FS_MAX_BYTES 或收窄 path 可改善` }
-          : {}),
+        ...(note ? { note } : {}),
         matches,
       };
     },
@@ -721,10 +1059,22 @@ export function createLocalTools(deps = {}) {
     exec(args = {}) {
       const command = typeof args.command === 'string' ? args.command.trim() : '';
       if (!command) throw new LocalToolError('invalid-params', '参数 command 缺失或为空');
-      const cwd = args.cwd ? guard(args.cwd, 'exec') : config.defaultCwd;
+      // 默认 cwd 也要过守卫（0.5.2）：0.5.1 只在 `args.cwd` 存在时 guard，于是
+      // 「不传 cwd」直接成了绕过白名单与三级保护的后门——defaultCwd 原样用作子进程工作目录。
+      const cwd = guard(args.cwd ?? config.defaultCwd, 'exec');
       const timeoutMs = Number.isInteger(args.timeoutMs) && args.timeoutMs > 0
         ? Math.min(args.timeoutMs, config.execTimeoutMs)
         : config.execTimeoutMs;
+
+      // 并发闸（0.5.2）：超限**立即报错**而不是排队。排队会让调用方以为命令在跑（实际
+      // 什么都没发生），而且队列本身又是一个无界资源。这条闸的存在理由是同进程还服务着
+      // 7 个桥工具——云端会话一次扇出几十条命令就能把本机与隧道一起拖垮。
+      if (execInFlight >= config.execMaxConcurrent) {
+        throw new LocalToolError(
+          'exec-busy',
+          `已有 ${execInFlight} 条命令在执行，达到并发上限 ${config.execMaxConcurrent}（启动时设 DSH_BRIDGE_EXEC_MAX_CONCURRENT 可调）。请等前一条结束再试，或改用 local_read_file/local_grep——读文件不需要 shell。`,
+        );
+      }
 
       return new Promise((resolvePromise) => {
         let stdout = '';
@@ -740,6 +1090,10 @@ export function createLocalTools(deps = {}) {
         let timedOut = false;
         let settled = false;
         let treeKillDone = false;
+        // 并发占位：只在 spawn **成功之后**递增，所以 spawnImpl 同步抛出时不会有配不上对的
+        // 递减；release 用 counted 幂等，close 与 exit 都触发 finish 也只归还一次。
+        let counted = false;
+        const release = () => { if (counted) { counted = false; execInFlight -= 1; } };
 
         const child = spawnImpl(command, {
           cwd,
@@ -748,11 +1102,13 @@ export function createLocalTools(deps = {}) {
           // detached 让子进程成为**新进程组的组长**，POSIX 上才能用 `process.kill(-pid)` 杀整棵树。
           // 0.5.0 没设它，`kill -9 -<child.pid>` 里的 child.pid 不是任何 PGID → ESRCH，孙进程成孤儿
           // 继续跑（正确性评审推断；本机无 POSIX 环境未实测）。Windows 上该选项无副作用。
-          detached: process.platform !== 'win32',
+          detached: platform !== 'win32',
           // 白名单 env（0.5.1）：全量继承会让一条 `node -e "console.log(process.env.TASK_BRIDGE_TOKEN)"`
           // 把桥 token 送进云端对话记录——评审双方独立实测，本机确有 MANA_API_KEY 等用户级秘密。
           env: buildExecEnv(envSource),
         });
+        counted = true;
+        execInFlight += 1;
 
         /**
          * 杀整棵进程树。
@@ -778,7 +1134,7 @@ export function createLocalTools(deps = {}) {
           const fallbackKill = () => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } };
           if (pid === undefined || pid === null) { fallbackKill(); return; }
 
-          if (process.platform === 'win32') {
+          if (platform === 'win32') {
             let tk;
             try {
               tk = treeKillFn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
@@ -797,9 +1153,10 @@ export function createLocalTools(deps = {}) {
             const tkTimer = setTimeout(fallbackKill, 2000);
             if (typeof tkTimer.unref === 'function') tkTimer.unref();
           } else {
-            // POSIX：detached:true 后 child.pid 即 PGID，用 process.kill 直接发信号，
+            // POSIX：detached:true 后 child.pid 即 PGID，用负号发信号给**整个进程组**，
             // 不依赖外部 /bin/kill 可执行文件（裁剪镜像里可能没有）。
-            try { process.kill(-pid, 'SIGKILL'); } catch { /* ESRCH/EPERM：已退出或无权 */ }
+            // ⚠️ 本机无 POSIX 环境，内核语义未实测；代码路径由注入 seam 的单测覆盖。
+            try { killFn(-pid, 'SIGKILL'); } catch { /* ESRCH/EPERM：已退出或无权 */ }
             fallbackKill();
           }
         };
@@ -812,6 +1169,7 @@ export function createLocalTools(deps = {}) {
         const finish = (result) => {
           if (settled) return;
           settled = true;
+          release(); // 归还并发额度：close 与 exit 都会走到这里，靠 settled 保证只归还一次
           if (timer) clearTimeout(timer);
           // 显式销毁 stdio 流：被 taskkill /T /F 终止的进程树仍可能留有管道句柄，
           // 不销毁则持有者（本进程）的 event loop 要等到句柄自然关闭——实测 500ms 的
@@ -820,7 +1178,7 @@ export function createLocalTools(deps = {}) {
           try { child.stdout?.destroy(); } catch { /* 已关闭 */ }
           try { child.stderr?.destroy(); } catch { /* 已关闭 */ }
           // 审计：记命令原文（命令不是秘密）；输出内容不记，可能含敏感数据
-          logger.info(`AUDIT local_exec cwd=${cwd} timeoutMs=${timeoutMs} exit=${result.exitCode} timedOut=${result.timedOut} command=${command}`);
+          audit(`AUDIT local_exec cwd=${auditField(cwd)} timeoutMs=${timeoutMs} exit=${result.exitCode} timedOut=${result.timedOut} command=${auditField(command)}`);
           resolvePromise(result);
         };
 
@@ -948,7 +1306,10 @@ export function buildLocalTools(deps = {}) {
           '参数：path（必填）；content（必填，字符串；写空文件传 ""）；mode（可选）。' +
           '回执含 existed / previousSize / newSize，便于确认是新建还是覆盖。' +
           '⚠️ 每次调用都写审计日志（路径+模式+字节数，不含内容）。⚠️ 这会让**云端模型会话**直接改动你的磁盘文件，' +
-          '且没有人在环的确认闸门——提示注入可指挥它篡改仓库。建议只在 git 工作树内使用，写完立刻 git diff 复核。',
+          '且没有人在环的确认闸门——提示注入可指挥它篡改仓库。建议只在 git 工作树内使用，写完立刻 git diff 复核。' +
+          '拒绝写入的路径：本链路凭据（不可解除）、默认凭据保护范围（~/.ssh、.env、私钥、shell history 等，可显式解除）、' +
+          'DSH_BRIDGE_FS_DENY 黑名单、bridge-mcp 自身包目录与审计日志文件（防持久化改写与销毁留痕）。' +
+          '被拒时回执 code 为 credential-protected / path-denied / self-write-protected。',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1003,16 +1364,20 @@ export function buildLocalTools(deps = {}) {
           '按正则在目录树或单个文件里搜内容（零依赖遍历，非 ripgrep）。' +
           '参数：pattern（必填，JS 正则语法）；path（可选，默认 bridge-mcp 的 cwd）；' +
           'caseInsensitive / onlyMatching / limit（可选，默认最多 100 处命中）。' +
-          '自动跳过 node_modules/.git/dist/build/coverage 与隐藏目录、跳过二进制与超限大文件；' +
-          '回执含 filesScanned 与 truncated（受 DSH_BRIDGE_GREP_MAX_FILES/MAX_DEPTH 约束）。' +
-          '大仓库搜索有界，命中被截断时请缩小 path 或收紧 pattern。',
+          '自动跳过 node_modules/.git/dist/build/coverage 与隐藏目录、跳过二进制与超限大文件。' +
+          '三重上界：文件数（DSH_BRIDGE_GREP_MAX_FILES）、深度（MAX_DEPTH）、整次墙上时间' +
+          '（DSH_BRIDGE_GREP_TIMEOUT_MS，默认 10000）。回执含 filesScanned / truncated / skipped / ' +
+          'regexTimedOut / wallTimedOut / elapsedMs。' +
+          '⚠️ 避免嵌套量词与重叠交替（如 (a+)+、([a-z]|[a-z])*）——它们会灾难性回溯，' +
+          '被时间预算强制中断时回执置 regexTimedOut=true 且结果严重不完整；请改用带字面前缀与锚点的收紧写法。' +
+          '命中被截断时缩小 path 或收紧 pattern。',
         inputSchema: {
           type: 'object',
           properties: {
-            pattern: { type: 'string', description: 'JS 正则（注意 \\d 需写 \\\\d）' },
+            pattern: { type: 'string', description: 'JS 正则（注意 \\d 需写 \\\\d）；避免嵌套量词，会灾难性回溯' },
             path: { type: 'string', description: '目录或单个文件；缺省为 bridge-mcp 进程 cwd' },
             caseInsensitive: { type: 'boolean' },
-            onlyMatching: { type: 'boolean', description: '只返回命中片段而非整行' },
+            onlyMatching: { type: 'boolean', description: '只返回命中片段而非整行（片段亦截到 500 字符）' },
             limit: { type: 'number' },
           },
           required: ['pattern'],
@@ -1022,7 +1387,12 @@ export function buildLocalTools(deps = {}) {
           properties: {
             ok: { type: 'boolean' }, pattern: { type: 'string' }, root: { type: 'string' },
             filesScanned: { type: 'number' }, matchCount: { type: 'number' },
-            truncated: { type: 'boolean' }, matches: { type: 'array' },
+            truncated: { type: 'boolean' }, limitTruncated: { type: 'boolean' },
+            depthLimited: { type: 'boolean' },
+            regexTimedOut: { type: 'boolean', description: '正则被时间预算强制中断（灾难性回溯）' },
+            wallTimedOut: { type: 'boolean', description: '整次搜索超出时间预算' },
+            elapsedMs: { type: 'number' }, regexMs: { type: 'number' }, grepTimeoutMs: { type: 'number' },
+            skipped: { type: 'object' }, note: { type: 'string' }, matches: { type: 'array' },
           },
           required: ['ok', 'matches'],
         },
@@ -1040,6 +1410,7 @@ export function buildLocalTools(deps = {}) {
         '没有人在环确认。命令经 shell 解释（Windows 上是 cmd.exe），`& | ^ < >` 等都是元字符、不做转义。' +
         '参数：command（必填）；cwd（可选，默认 bridge-mcp 进程 cwd）；timeoutMs（可选，上限受 DSH_BRIDGE_EXEC_TIMEOUT_MS 约束，默认 30000）。' +
         '回执含 exitCode/signal/timedOut/stdout/stderr；输出总量超 DSH_BRIDGE_FS_MAX_BYTES（默认 256KB）即 SIGKILL 并置 outputTruncated。' +
+        `同时在跑的命令数上限 DSH_BRIDGE_EXEC_MAX_CONCURRENT（默认 ${DEFAULT_EXEC_MAX_CONCURRENT}），超限立即返回 code=exec-busy 而不是排队——请等前一条结束，或改用 local_read_file/local_grep。` +
         '⚠️ 每次调用都写审计日志（命令原文 + cwd + 退出码；输出内容不记，可能含敏感数据）。' +
         '优先用 local_read_file/local_grep 而非 cat/findstr/grep——它们更快、有分页、且不触发 shell 解析。',
       inputSchema: {
@@ -1074,7 +1445,7 @@ export function buildLocalInstructions(config = resolveLocalToolsConfig()) {
   const lines = [];
   if (config.fsEnabled) {
     lines.push('本地文件工具（local_read_file / local_write_file / local_list_dir / local_grep）直接读写本机磁盘，不经 DSH 任务会话、不消耗模型额度、毫秒级返回原文。优先用它们读代码与配置，而不是 spawn 一个任务让 DSH agent 去读（后者慢、消耗 DSH 额度、且只能拿到尾部摘要）。');
-    lines.push('写文件纪律：local_write_file 会让云端会话直接改动磁盘且无人在环确认——只在用户明确授权的路径内写，写完主动提示用户 git diff 复核；不得写本链路凭据文件（会被拒绝），默认也拒绝 ~/.ssh、.env、私钥类路径。');
+    lines.push('写文件纪律：local_write_file 会让云端会话直接改动磁盘且无人在环确认——只在用户明确授权的路径内写，写完主动提示用户 git diff 复核；不得写本链路凭据文件（会被拒绝），默认也拒绝 ~/.ssh、~/.codex/auth.json、~/.config/gh/hosts.yml、.env、私钥、shell history 类路径，并拒绝改写 bridge-mcp 自身包目录与审计日志文件（防持久化与销毁留痕）。被拒绝时不要换路径绕过，直接告诉用户被哪一层保护拦住、以及解除它的代价。');
   }
   if (config.execEnabled) {
     lines.push('local_exec 把本机 shell 交给云端会话，是风险最高的工具：能用 local_read_file/local_grep 解决的绝不用 cat/findstr/grep；破坏性命令（rm/del/format/git push --force/git reset --hard）必须先向用户确认再执行，不得自行决定。');

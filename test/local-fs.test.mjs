@@ -5,12 +5,14 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 import {
   buildLocalTools,
   buildLocalInstructions,
   buildExecEnv,
+  allowRoots,
+  auditField,
   canonical,
   createLocalTools,
   guardPath,
@@ -18,9 +20,13 @@ import {
   isProtectedByDefault,
   protectedAlways,
   resolveLocalConfig,
+  selfPackageRoot,
+  writeProtectedPaths,
   LocalToolError,
   DEFAULT_MAX_BYTES,
   DEFAULT_EXEC_TIMEOUT_MS,
+  DEFAULT_EXEC_MAX_CONCURRENT,
+  DEFAULT_GREP_TIMEOUT_MS,
 } from '../src/local-fs.mjs';
 import { handleRpcMessage } from '../src/server.mjs';
 import { TOOLS } from '../src/tools.mjs';
@@ -28,14 +34,15 @@ import { TOOLS } from '../src/tools.mjs';
 const TMP = mkdtempSync(join(tmpdir(), 'dsh-local-fs-'));
 after(() => { try { rmSync(TMP, { recursive: true, force: true }); } catch { /* 尽力清理 */ } });
 
-/** 造一组只在临时目录里活动、日志可捕获的实现。 */
-function makeImpl(envOverrides = {}) {
+/** 造一组只在临时目录里活动、日志可捕获的实现。`deps` 用于注入 selfRoot 等测试替身。 */
+function makeImpl(envOverrides = {}, deps = {}) {
   const logs = { info: [], warn: [] };
   const env = { DSH_BRIDGE_LOCAL_FS: '1', ...envOverrides };
   const impl = createLocalTools({
     env,
     config: resolveLocalConfig(env),
     logger: { info: (m) => logs.info.push(m), warn: (m) => logs.warn.push(m) },
+    ...deps,
   });
   return { impl, logs, env };
 }
@@ -338,7 +345,9 @@ test('writeFile：新建文件、递归建父目录、回执如实报告 existed
   // 0.5.1：审计行**前置于 statSync**，所以记的是 writtenBytes（按内容算，无需 stat）而非 newSize。
   // 这样「写已落盘但 stat 抛错」时审计行不会丢——0.5.0 在该场景下 0 条审计。
   assert.match(logs.info[0], /mode=overwrite existed=false previousSize=0 writtenBytes=11/);
-  assert.match(logs.info[0], /^AUDIT local_write_file path=C:/u, '路径须保留 OS 正确大小写，不能是 canonical 的小写形式');
+  // 0.5.2：自由文本字段（path / command）改为 JSON-string 兼容的带引号转义形式，
+  // 防止命令或路径里的换行伪造额外审计行。大小写不变量仍然成立（`"C:` 而非 `"c:`）。
+  assert.match(logs.info[0], /^AUDIT local_write_file path="C:/u, '路径须保留 OS 正确大小写，不能是 canonical 的小写形式');
   assert.ok(!logs.info[0].includes('hello world'), '审计日志不得含文件内容');
 });
 
@@ -1117,7 +1126,9 @@ test('0.5.1 审计可落盘（DSH_BRIDGE_AUDIT_FILE）——stderr 在生产部�
   const auditFile = join(dir, 'audit.log');
   const target = join(dir, 'written.txt');
   const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_AUDIT_FILE: auditFile };
-  const impl = createLocalTools({ env, config: resolveLocalConfig(env) }); // 不注入 logger，用默认（含落盘）
+  // 不注入 logger。注意 0.5.1 时这是**必需**的：落盘挂在默认 logger 的 info 里，注入
+  // logger 就会静默丢掉审计。0.5.2 起审计走独立通道，注入与否都落盘（另有专门用例钉住）。
+  const impl = createLocalTools({ env, config: resolveLocalConfig(env) });
 
   impl.writeFile({ path: target, content: 'audit-me' });
 
@@ -1204,4 +1215,788 @@ test('0.5.1 guardPath 对 op=exec 的拒绝文案不得说「写入」', () => {
     assert.ok(!e.message.includes('拒绝写入'), '0.5.0 在 exec 场景下误说「拒绝写入」');
   }
 });
+
+// ---------------------------------------------------------------------------
+// 0.5.2 回归钉子：ReDoS 的硬时间上界（vm.runInContext timeout）
+//
+// 缺陷：0.5.1 的 grep 对 pattern 只有文件数/深度/命中数三重上界，**没有任何时间上界**。
+// 正则的灾难性回溯与文件数无关——一条 `(a+)+$` 配 33 字符输入就能冻住单线程 event loop。
+// bridge-mcp 是常驻 stdio server，event loop 一冻，7 个桥工具一起不可用。
+// 实测（Node v24.13.1）：原生跑过 15000ms 需外部 taskkill 才收场。
+//
+// 修法与选型都有实测依据，不是推断：vm 的 timeout 能中断回溯（402/404ms 抛出，抛错后
+// 同 context 与父进程 JS 均正常）；worker_threads 虽也能 terminate，但默认选项下子进程
+// stdout 会原样出现在父进程 stdout 上，而本进程 stdout 就是 JSON-RPC 信道，故不选。
+// ---------------------------------------------------------------------------
+
+const CATASTROPHIC = '(a+)+$';
+const REDOS_INPUT = `${'a'.repeat(32)}!`;
+
+test('0.5.2 灾难性回溯被时间预算中断，且中断后 server 仍能继续服务', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, 'victim.txt'), `before\n${REDOS_INPUT}\nafter\n`, 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_GREP_TIMEOUT_MS: '300' });
+
+  const t0 = Date.now();
+  const r = impl.grep({ pattern: CATASTROPHIC, path: join(dir, 'victim.txt') });
+  const elapsed = Date.now() - t0;
+
+  // 关键断言：阻塞**有上界**。修复前这里会挂到测试框架超时（原生实测 >15000ms）。
+  assert.ok(elapsed < 2500, `必须在预算量级内返回，实测 ${elapsed}ms（预算 300ms；修复前 >15000ms）`);
+  assert.equal(r.regexTimedOut, true, '必须如实标记正则被中断');
+  assert.equal(r.wallTimedOut, false, '这是正则中断，不是整次预算耗尽，两个标志不得混用');
+  assert.equal(r.truncated, true, '结果不完整必须可见');
+  assert.equal(r.skipped.regexTimeout, 1, '被中断的文件要计数，不能静默');
+  assert.match(r.note ?? '', /灾难性回溯/, 'note 要能指导调用方改写 pattern');
+  assert.equal(r.grepTimeoutMs, 300, '回执要带出生效的预算值');
+  assert.ok(Number.isInteger(r.elapsedMs) && r.elapsedMs >= 0, '回执要带实测耗时');
+
+  // 「7 个桥工具不会一起死」的直接证据：中断之后同实例仍能正常完成一次搜索。
+  const after = impl.grep({ pattern: 'before|after', path: join(dir, 'victim.txt') });
+  assert.equal(after.matchCount, 2);
+  assert.equal(after.regexTimedOut, false);
+});
+
+test('0.5.2 首个文件超时即停止遍历，不逐个文件把预算烧光', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  mkdirSync(join(dir, 'tree'), { recursive: true });
+  for (let i = 0; i < 8; i += 1) writeFileSync(join(dir, 'tree', `f${i}.txt`), `x\n${REDOS_INPUT}\n`, 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_GREP_TIMEOUT_MS: '300' });
+
+  const t0 = Date.now();
+  const r = impl.grep({ pattern: CATASTROPHIC, path: join(dir, 'tree') });
+  const elapsed = Date.now() - t0;
+
+  assert.ok(elapsed < 2500, `8 个文件的树总耗时应接近单个预算，实测 ${elapsed}ms`);
+  assert.equal(r.skipped.regexTimeout, 1, '中断一个文件后即收手；若为 8 说明逐文件各烧一次预算');
+  assert.equal(r.regexTimedOut, true);
+});
+
+test('0.5.2 limitTruncated 仍只表示 limit 截断，不被超时污染', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, 'v.txt'), REDOS_INPUT, 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_GREP_TIMEOUT_MS: '300' });
+  const r = impl.grep({ pattern: CATASTROPHIC, path: join(dir, 'v.txt') });
+  // 0.5.1 的 limitTruncated 语义是「命中数或文件数触顶」。若把超时也算进去，
+  // 调用方会误以为「收紧 limit 就能解决」，而真因是 pattern。
+  assert.equal(r.limitTruncated, false);
+  assert.equal(r.truncated, true);
+});
+
+test('0.5.2 预算不足一个合法 vm 时间片时走 wallTimedOut，绝不把 <=0 传给 vm', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, 'a.txt'), 'hello world\n', 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_GREP_TIMEOUT_MS: '1' });
+  const r = impl.grep({ pattern: 'hello', path: join(dir, 'a.txt') });
+  // vm 的 timeout 传 0/负数语义不明确；实现必须在剩余预算过小时**直接停**而不是交给 vm。
+  assert.equal(r.wallTimedOut, true);
+  assert.equal(r.regexTimedOut, false, '树太大与正则爆炸是两种结论，必须分开');
+  assert.equal(r.truncated, true);
+  assert.match(r.note ?? '', /预算内未跑完/);
+});
+
+test('0.5.2 正常 pattern 的正则语义零回归（锚点/量词/大小写/行号）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, 'code.js'), 'const value_1 = 1;\n  const VALUE_2 = 2;\n', 'utf8');
+  const { impl } = makeImpl({});
+
+  const anchored = impl.grep({ pattern: '^const value_\\d+', path: join(dir, 'code.js') });
+  assert.equal(anchored.matchCount, 1, '锚点在 vm 内语义不变');
+  assert.equal(anchored.matches[0].line, 1, '行号仍为 1 基');
+
+  const ci = impl.grep({ pattern: '^\\s*const value_2', path: join(dir, 'code.js'), caseInsensitive: true });
+  assert.equal(ci.matchCount, 1, 'caseInsensitive 仍生效');
+
+  const quant = impl.grep({ pattern: 'value_\\d{1}', path: join(dir, 'code.js') });
+  assert.equal(quant.matchCount, 1);
+
+  let threw = null;
+  try { impl.grep({ pattern: '([', path: dir }); } catch (e) { threw = e; }
+  assert.equal(threw?.code, 'invalid-params', '非法正则仍由主线程预编译挡下');
+  assert.match(threw?.message ?? '', /正则不合法/);
+});
+
+test('0.5.2 onlyMatching 片段必须截到 500 字符（0.5.1 不截，一条命中可带回整行）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, 'long.txt'), `${'z'.repeat(3000)}NEEDLE${'z'.repeat(3000)}`, 'utf8');
+  const { impl } = makeImpl({});
+
+  const exact = impl.grep({ pattern: 'NEEDLE', path: join(dir, 'long.txt'), onlyMatching: true });
+  assert.equal(exact.matches[0].text, 'NEEDLE', '短片段不受截断影响');
+
+  const wide = impl.grep({ pattern: 'z+', path: join(dir, 'long.txt'), onlyMatching: true });
+  assert.equal(wide.matches[0].text.length, 500, `实际 ${wide.matches[0].text.length}；×maxMatches 就是几十 MB 回执`);
+});
+
+test('0.5.2 pattern 只作为数据进入 vm，注入型 pattern 不构成代码执行', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, 'p.txt'), 'hello\n', 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_GREP_TIMEOUT_MS: '2000' });
+
+  // 若实现把 pattern 字符串插值进脚本文本，这里就会执行 process.exit 并带走测试进程。
+  let threw = null;
+  let r = null;
+  try {
+    r = impl.grep({ pattern: '")); process.exit(3); ("', path: join(dir, 'p.txt') });
+  } catch (e) { threw = e; }
+  assert.equal(threw?.code, 'invalid-params', '注入型 pattern 应止步于「正则不合法」');
+  assert.equal(r, null);
+
+  const ok = impl.grep({ pattern: 'hello', path: join(dir, 'p.txt') });
+  assert.equal(ok.matchCount, 1, '进程仍然存活且功能正常');
+});
+
+test('0.5.2 grepTimeoutMs 可配置，非法值回退默认而非猜测', () => {
+  assert.equal(resolveLocalConfig({}).grepTimeoutMs, DEFAULT_GREP_TIMEOUT_MS);
+  assert.equal(resolveLocalConfig({ DSH_BRIDGE_GREP_TIMEOUT_MS: '1234' }).grepTimeoutMs, 1234);
+  for (const bad of ['0', '-5', 'abc', '', '1.5']) {
+    assert.equal(
+      resolveLocalConfig({ DSH_BRIDGE_GREP_TIMEOUT_MS: bad }).grepTimeoutMs,
+      DEFAULT_GREP_TIMEOUT_MS,
+      `非法值 ${JSON.stringify(bad)} 必须回退默认`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 0.5.2 回归钉子：默认凭据保护清单补漏
+//
+// 缺陷：0.5.1 的清单是凭直觉列的常见项，漏掉多个**本机真实存在**的凭据位置。
+// 独立验证脚本实测本机 `.bash_history`、Chrome `Login Data`、Chrome `Local State`
+// 均存在且 0.5.1 下可读——网页会话一条 local_read_file 就能取走。
+//
+// 这批用例同时钉住「不误伤」：保护清单越宽越容易把正常文件挡死，而挡死的代价是
+// 用户以为工具坏了。tokens.json（设计系统）、auth.spec.ts、credentials.yaml.example
+// 之类必须仍然可读。
+// ---------------------------------------------------------------------------
+
+test('0.5.2 多段目录项（含分隔符）生效，且不误伤其父目录', () => {
+  const home = homedir();
+  // PROTECTED_DIRS 从 0.5.1 的单段名扩到可含分隔符；join+canonical 组合此前从未被验证。
+  for (const sub of ['gh', 'gcloud', 'rclone', 'op']) {
+    assert.equal(
+      isProtectedByDefault(join(home, '.config', sub, 'anything.yml'), home),
+      true,
+      `~/.config/${sub} 下的文件必须被拦`,
+    );
+  }
+  assert.equal(isProtectedByDefault(join(home, '.config'), home), false,
+    '~/.config 本身不能被拦，否则一切搜索都做不了');
+  assert.equal(isProtectedByDefault(join(home, '.config', 'git', 'config'), home), false,
+    '~/.config 下未列名的子目录不能被误伤');
+  // 既有单段项未被多段改动破坏
+  assert.equal(isProtectedByDefault(join(home, '.ssh', 'id_rsa'), home), true);
+  assert.equal(isProtectedByDefault(join(home, '.dsh', 'settings.yaml'), home), true);
+});
+
+test('0.5.2 评审点名的凭据位置逐项被拦', () => {
+  const home = homedir();
+  const cases = [
+    ['Codex CLI auth.json', join(home, '.codex', 'auth.json')],
+    ['Claude Code settings.json', join(home, '.claude', 'settings.json')],
+    ['Claude Code 会话转写', join(home, '.claude', 'projects', 'x', 'session.jsonl')],
+    ['OpenViking ov.conf', join(home, '.openviking', 'ov.conf')],
+    ['GitHub CLI hosts.yml', join(home, '.config', 'gh', 'hosts.yml')],
+    ['git credential store', join(home, '.git-credentials')],
+    ['Docker registry auth', join(home, '.docker', 'config.json')],
+    ['bash history', join(home, '.bash_history')],
+    ['zsh history', join(home, '.zsh_history')],
+    ['psql history', join(home, '.psql_history')],
+    ['node repl history', join(home, '.node_repl_history')],
+    ['lesshst', join(home, '.lesshst')],
+    ['Chromium 密码库', join(home, 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Default', 'Login Data')],
+    ['Chromium 解密密钥', join(home, 'AppData', 'Local', 'Google', 'Chrome', 'User Data', 'Local State')],
+    ['Terraform Cloud token', join(home, '.terraform.d', 'credentials.tfrc.json')],
+    ['RubyGems 无扩展名凭据', join(home, '.gem', 'credentials')],
+    ['gcloud 凭据库', join(home, '.config', 'gcloud', 'credentials.db')],
+    ['PuTTY 私钥', join(home, 'keys', 'mykey.ppk')],
+    ['k8s/helm secrets', join(home, 'proj', 'secrets.yaml')],
+    ['rclone.conf 任意位置', join(home, 'elsewhere', 'rclone.conf')],
+    ['auth.json 任意位置', join(home, 'proj', 'auth.json')],
+  ];
+  for (const [label, p] of cases) {
+    assert.equal(isProtectedByDefault(p, home), true, `${label} 必须被默认保护拦住：${p}`);
+  }
+});
+
+test('0.5.2 补漏不得误伤常见正常文件名', () => {
+  const home = homedir();
+  const dir = join(home, 'some-project');
+  const benign = [
+    'auth.spec.ts', 'authService.ts', 'authentication.md', 'author.json',
+    'credentials_test.go', 'mycredentials.txt', 'credentials.yaml.example',
+    'env.d.ts', 'environment.json', 'token.md',
+    'tokens.json',        // 设计系统的 design tokens，是常见合法文件，刻意不纳入保护
+    'secret_notes.md', 'history.md', 'browserhistory.csv',
+    'state.json', 'localState.ts', 'loginData.ts', 'data.json',
+    'README.md', 'package.json', 'index.mjs', 'config.yaml',
+    'gh.md', 'Dockerfile', 'terraform.tf', 'main.tf', 'codex.md', 'rclone.md',
+  ];
+  for (const name of benign) {
+    assert.equal(isProtectedByDefault(join(dir, name), home), false, `${name} 不该被拦`);
+  }
+});
+
+test('0.5.2 新增项走「默认保护」语义：可显式解除，但强制保护不受影响', () => {
+  const home = homedir();
+  const codexAuth = join(home, '.codex', 'auth.json');
+  const bridgeToken = join(home, '.dsh', 'task-bridge-token');
+
+  try {
+    guardPath(codexAuth, { env: {}, op: 'read', home });
+    assert.fail('新增项默认应被拒');
+  } catch (e) {
+    assert.equal(e.code, 'credential-protected');
+    assert.match(e.message, /DSH_BRIDGE_FS_DENY_CREDENTIALS=0/, '文案必须告诉用户如何解除');
+  }
+  // 默认保护可解除——这是它与 PROTECTED_ALWAYS 的语义边界，不能被补漏改动搞混
+  assert.equal(typeof guardPath(codexAuth, { env: { DSH_BRIDGE_FS_DENY_CREDENTIALS: '0' }, op: 'read', home }), 'string');
+  // 强制保护不因同一个开关而解除
+  assert.throws(
+    () => guardPath(bridgeToken, { env: { DSH_BRIDGE_FS_DENY_CREDENTIALS: '0' }, op: 'read', home }),
+    (e) => e.code === 'credential-protected',
+    '本链路凭据的保护不可通过配置解除',
+  );
+});
+
+test('0.5.2 新增保护在递归遍历中同样生效（不只作用于根）', (t) => {
+  // 0.5.1 修的是「walk 内逐条目 guard」；补漏的清单必须走同一条路径才算真生效。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, '.git-credentials'), 'https://user:SYNTHETIC-FAKE-TOKEN@github.com\n', 'utf8');
+  writeFileSync(join(dir, '.bash_history'), 'export SYNTHETIC_FAKE_SECRET=1\n', 'utf8');
+  writeFileSync(join(dir, 'normal.txt'), 'visible content\n', 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1' });
+
+  const g = impl.grep({ pattern: 'SYNTHETIC', path: dir });
+  assert.equal(g.matchCount, 0, '受保护文件的内容绝不能出现在命中里');
+  assert.ok(!JSON.stringify(g).includes('SYNTHETIC-FAKE-TOKEN'), '回执任何字段都不得含秘密片段');
+  assert.equal(g.skipped.protected, 2, '.git-credentials 与 .bash_history 两个跳过都要计数');
+
+  const l = impl.listDir({ path: dir });
+  const names = l.entries.map((e) => e.name);
+  assert.ok(!names.includes('.git-credentials'), '列举不得暴露受保护文件的路径');
+  assert.ok(!names.includes('.bash_history'));
+  assert.ok(names.includes('normal.txt'), '正常文件仍要列出');
+  assert.equal(l.skippedProtected, 2);
+});
+
+// ---------------------------------------------------------------------------
+// 0.5.2 回归钉子：自身完整性保护（禁止改写 bridge-mcp 自己的源码与审计文件）
+//
+// 缺陷：生产 profile 的 command 直接指向工作树的 src/server.mjs，所以一次
+// local_write_file 改写本包源码，会在下次进程重启后被原样加载——那不是破坏，是**持久化**。
+//
+// 作用域边界（实测得出，不是推断）：local_exec 开着时这层保护拦不住 `echo > src/...`，
+// 因为攻击者有 shell。所以它真正防的是「只开 LOCAL_FS 不开 shell」这个更窄配置下
+// write_file 这条唯一通道。README 同样写明这条边界。
+//
+// ⚠️ 用例一律只断言「抛错」，绝不对真实包源码执行写入；需要验证「解除后确实能写」时
+//    用注入的临时 selfRoot。
+// ---------------------------------------------------------------------------
+
+test('0.5.2 改写本包源码被拒，且文件字节与 mtime 均未变', () => {
+  const selfRoot = selfPackageRoot();
+  const src = join(selfRoot, 'src', 'local-fs.mjs');
+  const before = readFileSync(src);
+  const beforeMtime = statSync(src).mtimeMs;
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1' });
+
+  let threw = null;
+  try { impl.writeFile({ path: src, content: '// backdoored\n' }); } catch (e) { threw = e; }
+
+  assert.equal(threw?.code, 'self-write-protected');
+  assert.match(threw?.message ?? '', /持久化/, '文案要说清这是持久化风险而不是普通拒绝');
+  assert.match(threw?.message ?? '', /DSH_BRIDGE_FS_ALLOW_SELF_WRITE=1/, '文案要给出解除办法');
+  assert.ok(readFileSync(src).equals(before), '文件内容必须一字未改');
+  assert.equal(statSync(src).mtimeMs, beforeMtime, '连 mtime 都不能动');
+});
+
+test('0.5.2 包内任意路径（含新建文件、append 模式）均被拒', () => {
+  const selfRoot = selfPackageRoot();
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1' });
+  for (const rel of ['src/server.mjs', 'package.json', 'src/NEW-BACKDOOR.mjs', 'test/local-fs.test.mjs']) {
+    let threw = null;
+    try { impl.writeFile({ path: join(selfRoot, rel), content: 'x' }); } catch (e) { threw = e; }
+    assert.equal(threw?.code, 'self-write-protected', `${rel} 必须被拒`);
+  }
+  // append 也要拦：否则可往源码尾部追加而不触发「覆盖」直觉
+  let threwAppend = null;
+  try {
+    impl.writeFile({ path: join(selfRoot, 'src', 'local-fs.mjs'), content: '\n// appended\n', mode: 'append' });
+  } catch (e) { threwAppend = e; }
+  assert.equal(threwAppend?.code, 'self-write-protected');
+});
+
+test('0.5.2 读自身源码仍放行（本包是公开仓库，挡读只妨碍正常使用）', () => {
+  const selfRoot = selfPackageRoot();
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1' });
+  const r = impl.readFile({ path: join(selfRoot, 'src', 'local-fs.mjs'), limit: 5 });
+  assert.equal(r.ok, true);
+  assert.ok(r.returnedLines > 0);
+  assert.ok(impl.grep({ pattern: 'writeProtectedPaths', path: join(selfRoot, 'src') }).matchCount > 0);
+  assert.ok(impl.listDir({ path: join(selfRoot, 'src') }).count > 0);
+  // op=read 不得触发写保护
+  assert.equal(typeof guardPath(join(selfRoot, 'src', 'local-fs.mjs'), { env: {}, op: 'read' }), 'string');
+});
+
+test('0.5.2 路径变形不得绕过写保护（大小写 / ADS / UNC / 目录本身 / 尾分隔符）', () => {
+  const selfRoot = selfPackageRoot();
+  const src = join(selfRoot, 'src', 'local-fs.mjs');
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1' });
+  const variants = [
+    src.toUpperCase(),
+    `${src}::$DATA`,
+    `\\\\?\\${src}`,
+    selfRoot,
+    `${selfRoot}\\`,
+  ];
+  for (const v of variants) {
+    let threw = null;
+    try { impl.writeFile({ path: v, content: 'x' }); } catch (e) { threw = e; }
+    assert.equal(threw?.code, 'self-write-protected', `变形未被拦：${v}`);
+  }
+});
+
+test('0.5.2 注入的 selfRoot 必须被 canonical（否则保护静默失效——本批次实测踩到的坑）', (t) => {
+  // writeProtectedPaths 一度只对 auditFile 做 canonical、selfRoot 原样入清单；
+  // 而 guardPath 拿来比的 abs 是 canonical（Windows 下小写），于是注入路径**永不相等**。
+  // 默认路径侥幸没事（selfPackageRoot 自己返回 canonical），注入路径全线失效。
+  // 0.5.1 的 guardWalkEntry 栽过同一个坑，这是第二次复发，所以单独钉一条。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  const target = join(dir, 'src', 'x.mjs');
+  writeFileSync(target, 'original\n', 'utf8');
+
+  // 故意传**非 canonical**（混合大小写）的 selfRoot
+  const mixedCase = dir.toUpperCase();
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1' }, { selfRoot: mixedCase });
+
+  let threw = null;
+  try { impl.writeFile({ path: target, content: 'pwned\n' }); } catch (e) { threw = e; }
+  assert.equal(threw?.code, 'self-write-protected', '混合大小写的注入 selfRoot 也必须拦住');
+  assert.equal(readFileSync(target, 'utf8'), 'original\n', '文件不得被改写');
+
+  // 清单里的路径必须是 canonical 形式
+  const list = writeProtectedPaths({ env: {}, selfRoot: mixedCase });
+  assert.equal(list[0].path, canonical(mixedCase), '清单条目必须已 canonical');
+});
+
+test('0.5.2 DSH_BRIDGE_FS_ALLOW_SELF_WRITE=1 解除写保护并打强告警', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  mkdirSync(join(dir, 'src'), { recursive: true });
+  const target = join(dir, 'src', 'x.mjs');
+  writeFileSync(target, 'original\n', 'utf8');
+
+  const { impl, logs } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW_SELF_WRITE: '1' }, { selfRoot: dir });
+  assert.ok(logs.warn.some((w) => /ALLOW_SELF_WRITE=1/.test(w) && /持久化/.test(w)),
+    '解除是不可逆的风险放大，必须在日志里可见');
+
+  const r = impl.writeFile({ path: target, content: 'overwritten\n' });
+  assert.equal(r.ok, true);
+  assert.equal(readFileSync(target, 'utf8'), 'overwritten\n');
+  assert.equal(writeProtectedPaths({ env: { DSH_BRIDGE_FS_ALLOW_SELF_WRITE: '1' } }).length, 0);
+});
+
+test('0.5.2 审计文件写保护不可被 ALLOW_SELF_WRITE 解除（销毁留痕不算能力）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const auditFile = join(dir, 'audit.log');
+  writeFileSync(auditFile, 'AUDIT pre-existing evidence\n', 'utf8');
+
+  const { impl } = makeImpl(
+    { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW_SELF_WRITE: '1', DSH_BRIDGE_AUDIT_FILE: auditFile },
+    { selfRoot: dir },
+  );
+  let threw = null;
+  try { impl.writeFile({ path: auditFile, content: '' }); } catch (e) { threw = e; }
+  assert.equal(threw?.code, 'self-write-protected');
+  assert.match(threw?.message ?? '', /不可通过配置解除/);
+  assert.equal(readFileSync(auditFile, 'utf8'), 'AUDIT pre-existing evidence\n', '审计内容不得被清空');
+
+  const list = writeProtectedPaths({ env: { DSH_BRIDGE_FS_ALLOW_SELF_WRITE: '1' }, auditFile });
+  assert.equal(list.length, 1, '解除自身写保护后审计文件仍应在清单里');
+  assert.equal(list[0].overridable, false);
+
+  // 但审计功能本身照常：写别的文件仍会追加审计行
+  impl.writeFile({ path: join(dir, 'legit.txt'), content: 'hello\n' });
+  assert.match(readFileSync(auditFile, 'utf8'), /AUDIT local_write_file/);
+});
+
+test('0.5.2 包外正常写入零回归，包根上层目录不被误伤', () => {
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1' });
+  const selfRoot = selfPackageRoot();
+  // 上层目录（本仓库其它文件）：只校验不落盘，免得测试真去改仓库
+  assert.doesNotThrow(() => guardPath(join(selfRoot, '..', 'README.md'), { env: {}, op: 'write' }));
+});
+
+// ---------------------------------------------------------------------------
+// 0.5.2 回归钉子：审计行防注入 + local_exec 并发闸
+// ---------------------------------------------------------------------------
+
+test('0.5.2 auditField 转义换行/制表/引号/反斜杠，且输出可被 JSON.parse 还原', () => {
+  const cases = [
+    ['plain', 'plain'],
+    ['换行', 'a\nb'],
+    ['回车', 'a\rb'],
+    ['制表', 'a\tb'],
+    ['双引号', 'a"b'],
+    ['反斜杠', 'C:\\dir\\file'],
+    ['尾部反斜杠', 'C:\\'],
+    ['伪造审计行', 'dir\nAUDIT local_exec exit=0 command=rm -rf /'],
+  ];
+  for (const [label, raw] of cases) {
+    const encoded = auditField(raw);
+    assert.ok(encoded.startsWith('"') && encoded.endsWith('"'), `${label} 必须带引号`);
+    assert.ok(!encoded.slice(1, -1).includes('\n'), `${label} 编码后不得含裸换行`);
+    assert.ok(!encoded.slice(1, -1).includes('\r'), `${label} 编码后不得含裸回车`);
+    assert.equal(JSON.parse(encoded), raw, `${label} 必须可无损还原`);
+  }
+});
+
+test('0.5.2 命令里的换行不能伪造额外审计行', async (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const auditFile = join(dir, 'audit.log');
+  const { impl, logs } = makeImpl({ DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_AUDIT_FILE: auditFile });
+
+  const evil = `node -e "process.stdout.write('x')"\nAUDIT local_exec cwd=fake exit=0 timedOut=false command="rm -rf /"`;
+  await impl.exec({ command: evil, cwd: dir, timeoutMs: 15000 });
+
+  // 落盘审计必须只有一行，注入的假行不得成为独立记录
+  const lines = readFileSync(auditFile, 'utf8').replace(/\n$/, '').split('\n');
+  assert.equal(lines.length, 1, `注入换行后应仍只有 1 条审计，实际 ${lines.length}`);
+  assert.match(lines[0], /^AUDIT local_exec /);
+  // 原文仍可无损还原（取证价值不因转义而丢失）
+  const m = lines[0].match(/command="(.*)"$/);
+  assert.ok(m, '审计行必须带 command 字段');
+  assert.equal(JSON.parse(`"${m[1]}"`), evil.trim(), '命令原文要能还原，包括其中的换行');
+  assert.equal(logs.info.filter((l) => l.startsWith('AUDIT ')).length, 1);
+});
+
+test('0.5.2 审计落盘与 logger 是否被注入无关（0.5.1 注入即静默丢失）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const auditFile = join(dir, 'audit.log');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_AUDIT_FILE: auditFile };
+  // 故意注入一个「什么都不做」的 logger：0.5.1 下审计会随之消失
+  const impl = createLocalTools({
+    env,
+    config: resolveLocalConfig(env),
+    logger: { info: () => {}, warn: () => {} },
+  });
+  impl.writeFile({ path: join(dir, 'x.txt'), content: 'hello' });
+  assert.ok(existsSync(auditFile), '即便 logger 被注入且丢弃一切，审计仍必须落盘');
+  assert.match(readFileSync(auditFile, 'utf8'), /^AUDIT local_write_file path="/);
+});
+
+test('0.5.2 exec 并发闸：超限立即报 exec-busy，结束后额度归还', async (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const sleeper = writeScript('sleep-250.mjs', 'setTimeout(()=>{},250);');
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_EXEC_MAX_CONCURRENT: '2' });
+
+  const p1 = impl.exec({ command: `node "${sleeper}"`, cwd: TMP, timeoutMs: 10000 });
+  const p2 = impl.exec({ command: `node "${sleeper}"`, cwd: TMP, timeoutMs: 10000 });
+  // 第三条必须**同步**被拒（不是排队）：排队会让调用方以为命令在跑
+  let threw = null;
+  try { impl.exec({ command: `node "${sleeper}"`, cwd: TMP, timeoutMs: 10000 }); } catch (e) { threw = e; }
+  assert.equal(threw?.code, 'exec-busy', '超出并发上限必须报 exec-busy');
+  assert.match(threw?.message ?? '', /DSH_BRIDGE_EXEC_MAX_CONCURRENT/);
+  assert.match(threw?.message ?? '', /local_read_file/, '文案要给出替代路径');
+
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.equal(r1.exitCode, 0);
+  assert.equal(r2.exitCode, 0);
+
+  // 额度必须归还：close 与 exit 都会触发 finish，重复归还会让计数变负、闸门失效
+  const p3 = impl.exec({ command: `node "${sleeper}"`, cwd: TMP, timeoutMs: 10000 });
+  const p4 = impl.exec({ command: `node "${sleeper}"`, cwd: TMP, timeoutMs: 10000 });
+  const [r3, r4] = await Promise.all([p3, p4]);
+  assert.equal(r3.exitCode, 0);
+  assert.equal(r4.exitCode, 0);
+});
+
+test('0.5.2 超时/输出超限路径同样归还并发额度（不泄漏）', async (t) => {
+  const sleeper = writeScript('sleep-1200.mjs', 'setTimeout(()=>{},1200);');
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_EXEC_MAX_CONCURRENT: '1' });
+
+  const timed = await impl.exec({ command: `node "${sleeper}"`, cwd: TMP, timeoutMs: 200 });
+  assert.equal(timed.timedOut, true, '前置条件：这条必须真的超时');
+
+  // 若超时路径漏了 release，这里会直接 exec-busy
+  const after = await impl.exec({ command: 'node -e "process.stdout.write(\'ok\')"', cwd: TMP, timeoutMs: 10000 });
+  assert.equal(after.exitCode, 0, '超时之后额度必须已归还');
+  assert.match(after.stdout, /ok/);
+});
+
+test('0.5.2 execMaxConcurrent 可配置，非法值回退默认而非猜测', () => {
+  assert.equal(resolveLocalConfig({}).execMaxConcurrent, DEFAULT_EXEC_MAX_CONCURRENT);
+  assert.equal(resolveLocalConfig({ DSH_BRIDGE_EXEC_MAX_CONCURRENT: '7' }).execMaxConcurrent, 7);
+  for (const bad of ['0', '-1', 'abc', '', '2.5']) {
+    assert.equal(resolveLocalConfig({ DSH_BRIDGE_EXEC_MAX_CONCURRENT: bad }).execMaxConcurrent,
+      DEFAULT_EXEC_MAX_CONCURRENT, `非法值 ${JSON.stringify(bad)} 必须回退默认`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 0.5.2 回归钉子：DSH_BRIDGE_FS_ALLOW 白名单模式
+//
+// 白名单最容易写错的不是「拦不住外面」，而是：① 它会不会**放宽**别的保护；
+// ② 递归遍历里生不生效（0.5.0 就是只在根上生效，被一次 grep 打穿）；
+// ③ 能不能用 `..` / 路径变形 / 「不传 cwd」绕过去。三条都单独钉住。
+// ---------------------------------------------------------------------------
+
+test('0.5.2 allowRoots 解析：未设/空/纯分隔符均为 null（= 不启用，零回归）', () => {
+  assert.equal(allowRoots({}), null);
+  assert.equal(allowRoots({ DSH_BRIDGE_FS_ALLOW: '' }), null);
+  assert.equal(allowRoots({ DSH_BRIDGE_FS_ALLOW: '   ' }), null);
+  assert.equal(allowRoots({ DSH_BRIDGE_FS_ALLOW: `${delimiter}${delimiter}` }), null);
+  const one = allowRoots({ DSH_BRIDGE_FS_ALLOW: TMP });
+  assert.equal(one.length, 1);
+  assert.equal(one[0], canonical(TMP), '根必须是 canonical 形式，否则与 abs 永不相等');
+});
+
+test('0.5.2 白名单外一律 path-not-allowed，白名单内正常', (t) => {
+  const inside = makeTempDir();
+  const outside = makeTempDir();
+  t.after(() => { cleanup(inside); cleanup(outside); });
+  writeFileSync(join(inside, 'keep.txt'), 'inside\n', 'utf8');
+  writeFileSync(join(outside, 'gone.txt'), 'outside\n', 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_FS_ALLOW: inside });
+
+  assert.equal(impl.readFile({ path: join(inside, 'keep.txt') }).ok, true);
+  assert.equal(impl.listDir({ path: inside }).ok, true);
+  assert.equal(impl.grep({ pattern: 'inside', path: inside }).matchCount, 1);
+  assert.equal(impl.writeFile({ path: join(inside, 'new.txt'), content: 'x' }).ok, true);
+
+  for (const [label, fn] of [
+    ['readFile', () => impl.readFile({ path: join(outside, 'gone.txt') })],
+    ['writeFile', () => impl.writeFile({ path: join(outside, 'pwn.txt'), content: 'x' })],
+    ['listDir', () => impl.listDir({ path: outside })],
+    ['grep', () => impl.grep({ pattern: 'outside', path: outside })],
+    ['exec(cwd)', () => impl.exec({ command: 'node -v', cwd: outside })],
+  ]) {
+    assert.throws(fn, (e) => e.code === 'path-not-allowed', `${label} 对白名单外必须报 path-not-allowed`);
+  }
+});
+
+test('0.5.2 白名单**只收窄不放宽**：覆盖 home 也不解除凭据保护', () => {
+  // 这是白名单最危险的写法错误：若白名单是「替代」而非「AND」，把 home 加进去
+  // 就等于一键解除全部凭据保护，这个开关本身会变成自毁按钮。
+  const home = homedir();
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: home };
+  for (const [label, p] of [
+    ['强制保护：桥 token', join(home, '.dsh', 'task-bridge-token')],
+    ['强制保护：DSH 凭据', join(home, '.dsh', '.credentials.yaml')],
+    ['默认保护：ssh 私钥', join(home, '.ssh', 'id_rsa')],
+    ['默认保护：Codex 令牌', join(home, '.codex', 'auth.json')],
+    ['默认保护：shell history', join(home, '.bash_history')],
+  ]) {
+    assert.throws(
+      () => guardPath(p, { env, op: 'read', home }),
+      (e) => e.code === 'credential-protected',
+      `${label} 在白名单内仍必须被凭据保护拦住`,
+    );
+  }
+  // 自身写保护同理：白名单覆盖到本包也不能改写本包源码
+  const selfSrc = join(selfPackageRoot(), 'src', 'local-fs.mjs');
+  assert.throws(
+    () => guardPath(selfSrc, { env: { DSH_BRIDGE_FS_ALLOW: selfPackageRoot() }, op: 'write' }),
+    (e) => e.code === 'self-write-protected',
+    '拒绝原因必须是更具体的 self-write-protected，而不是被白名单挡下',
+  );
+});
+
+test('0.5.2 `..` 穿越以 canonical 为准：逃不出去', (t) => {
+  const root = makeTempDir();
+  const inside = join(root, 'proj');
+  mkdirSync(inside, { recursive: true });
+  const outside = makeTempDir();
+  t.after(() => { cleanup(root); cleanup(outside); });
+  writeFileSync(join(outside, 'secret.txt'), 'TOP-SECRET\n', 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: inside });
+
+  // inside/../../<outside> 精确指向白名单外的真实文件
+  const escape = join(inside, '..', '..', outside.split(/[\\/]/).pop(), 'secret.txt');
+  assert.throws(() => impl.readFile({ path: escape }), (e) => e.code === 'path-not-allowed',
+    '`..` 穿越必须在 canonical 之后判定，否则字符串前缀匹配会被绕过');
+  // 反斜杠写法同样
+  assert.throws(
+    () => impl.readFile({ path: `${inside}\\..\\..\\${outside.split(/[\\/]/).pop()}\\secret.txt` }),
+    (e) => e.code === 'path-not-allowed',
+  );
+});
+
+test('0.5.2 路径变形不得进出白名单；白名单根写成大写仍然匹配', (t) => {
+  const inside = makeTempDir();
+  const outside = makeTempDir();
+  t.after(() => { cleanup(inside); cleanup(outside); });
+  writeFileSync(join(inside, 'keep.txt'), 'x\n', 'utf8');
+  const outsideFile = join(outside, 'gone.txt');
+  writeFileSync(outsideFile, 'y\n', 'utf8');
+
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: inside });
+  for (const variant of [outsideFile.toUpperCase(), `${outsideFile}::$DATA`, `\\\\?\\${outsideFile}`]) {
+    assert.throws(() => impl.readFile({ path: variant }), (e) => e.code === 'path-not-allowed',
+      `变形不得绕过白名单：${variant}`);
+  }
+  // 用户常从资源管理器复制到大写盘符路径；根写成大写时内部正常路径必须仍可访问
+  const { impl: upper } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: inside.toUpperCase() });
+  assert.equal(upper.readFile({ path: join(inside, 'keep.txt') }).ok, true, '白名单根的大小写变体必须等价');
+});
+
+test('0.5.2 递归遍历内部逐条目遵守白名单（0.5.0 的同一条纪律）', (t) => {
+  const root = makeTempDir();
+  t.after(() => cleanup(root));
+  const inside = join(root, 'in');
+  const outside = join(root, 'out');
+  mkdirSync(inside, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(inside, 'a.txt'), 'MARK\n', 'utf8');
+  writeFileSync(join(outside, 'b.txt'), 'MARK\n', 'utf8');
+
+  // 白名单只含 inside，但搜索根给 root（root 本身在白名单外 → 根就被拒）
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: inside });
+  assert.throws(() => impl.grep({ pattern: 'MARK', path: root }), (e) => e.code === 'path-not-allowed');
+
+  // 白名单给 root（两个子目录都在内），但用 FS_DENY 拉黑 outside：
+  // walk 必须逐条目生效，只搜到 inside 的那一处
+  const { impl: both } = makeImpl({
+    DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: root, DSH_BRIDGE_FS_DENY: outside,
+  });
+  const g = both.grep({ pattern: 'MARK', path: root });
+  assert.equal(g.matchCount, 1, '只能命中白名单内且未被拉黑的那一处');
+  assert.equal(g.skipped.protected, 1, '被拉黑的条目要计数');
+  const l = both.listDir({ path: root, recursive: true });
+  assert.ok(!l.entries.some((e) => e.path.includes('b.txt')), '递归列举同样不得越界');
+
+  // guardWalkEntry 层面直接断言
+  assert.equal(guardWalkEntry(join(inside, 'a.txt'), { env: { DSH_BRIDGE_FS_ALLOW: inside } }) !== null, true);
+  assert.equal(guardWalkEntry(join(outside, 'b.txt'), { env: { DSH_BRIDGE_FS_ALLOW: inside } }), null);
+  assert.equal(guardWalkEntry(join(outside, 'b.txt'), { env: {} }) !== null, true, '未启用白名单时零回归');
+});
+
+test('0.5.2 「不传 cwd/path」不得成为绕过白名单的后门', async (t) => {
+  const inside = makeTempDir();
+  const outside = makeTempDir();
+  t.after(() => { cleanup(inside); cleanup(outside); });
+  const { impl } = makeImpl({
+    DSH_BRIDGE_LOCAL_FS: '1',
+    DSH_BRIDGE_LOCAL_EXEC: '1',
+    DSH_BRIDGE_FS_ALLOW: inside,
+    DSH_BRIDGE_LOCAL_CWD: outside, // 默认 cwd 故意指向白名单外
+  });
+  // 0.5.1 只在 args.cwd 存在时才 guard，于是「不传 cwd」直接把 defaultCwd 原样交给子进程
+  assert.throws(() => impl.exec({ command: 'node -v' }), (e) => e.code === 'path-not-allowed',
+    'exec 不传 cwd 时默认 cwd 也必须过白名单');
+  assert.throws(() => impl.grep({ pattern: 'x' }), (e) => e.code === 'path-not-allowed',
+    'grep 不传 path 时默认根也必须过白名单');
+
+  const { impl: ok } = makeImpl({
+    DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_LOCAL_EXEC: '1',
+    DSH_BRIDGE_FS_ALLOW: inside, DSH_BRIDGE_LOCAL_CWD: inside,
+  });
+  const r = await ok.exec({ command: 'node -e "process.stdout.write(\'ok\')"', timeoutMs: 15000 });
+  assert.equal(r.exitCode, 0, '默认 cwd 在白名单内时正常执行');
+});
+
+test('0.5.2 白名单支持多根（path.delimiter 分隔）', (t) => {
+  const a = makeTempDir();
+  const b = makeTempDir();
+  const c = makeTempDir();
+  t.after(() => { cleanup(a); cleanup(b); cleanup(c); });
+  for (const [d, n] of [[a, 'a.txt'], [b, 'b.txt'], [c, 'c.txt']]) writeFileSync(join(d, n), 'x\n', 'utf8');
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: [a, b].join(delimiter) });
+  assert.equal(allowRoots({ DSH_BRIDGE_FS_ALLOW: [a, b].join(delimiter) }).length, 2);
+  assert.equal(impl.readFile({ path: join(a, 'a.txt') }).ok, true);
+  assert.equal(impl.readFile({ path: join(b, 'b.txt') }).ok, true);
+  assert.throws(() => impl.readFile({ path: join(c, 'c.txt') }), (e) => e.code === 'path-not-allowed');
+});
+
+test('0.5.2 白名单启用时启动日志声明范围，并说明它拦不住什么', () => {
+  const { logs } = makeImpl({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_ALLOW: TMP });
+  const line = logs.info.find((m) => /DSH_BRIDGE_FS_ALLOW 白名单已启用/.test(m));
+  assert.ok(line, '必须声明白名单已生效，否则操作者无法确认开关真的起作用了');
+  assert.match(line, /不解除任何凭据保护/, '必须说明是 AND 关系');
+  assert.match(line, /管不住 local_exec/, '必须说明 exec 用绝对路径仍可越界，避免误以为设了白名单就安全');
+});
+
+// ---------------------------------------------------------------------------
+// 0.5.2 回归钉子：POSIX 进程组终止分支
+//
+// 诚实边界：本机是 Windows，且 `wsl.exe -l -v` 返回「没有已安装的分发版」，
+// 所以**Linux 内核语义无法实测**。以下用例通过注入 platform/killFn 覆盖代码路径
+// （detached、负 pid、SIGKILL、兜底 kill、不去 spawn taskkill），把「未测死代码」
+// 降级为「分支已测、内核语义未验证」。后者才是能如实写进文档的表述。
+// ---------------------------------------------------------------------------
+
+/** 造一个只记录事件的假子进程；close 晚于超时定时器，确保 treeKill 一定被调用。 */
+function fakeTreeChild(events, pid = 4242) {
+  return {
+    stdout: { on() {}, destroy() {} },
+    stderr: { on() {}, destroy() {} },
+    on: (ev, fn) => { if (ev === 'close') setTimeout(() => fn(null, 'SIGKILL'), 30); },
+    kill: () => events.push('child.kill'),
+    pid,
+  };
+}
+
+test('0.5.2 POSIX 分支：detached:true + kill(-pid, SIGKILL) + 兜底 kill，且不 spawn taskkill', async () => {
+  const events = [];
+  let spawnOpts = null;
+  const env = { DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_EXEC_TIMEOUT_MS: '1000' };
+  const impl = createLocalTools({
+    env, config: resolveLocalConfig(env), logger: { info() {}, warn() {} },
+    platform: 'linux',
+    killFn: (pid, signal) => events.push(`kill(${pid},${signal})`),
+    spawnFn: (cmd, opts) => { spawnOpts = opts; return fakeTreeChild(events); },
+    treeKillFn: () => { events.push('UNEXPECTED-taskkill'); return { on() {}, stdout: { resume() {} }, stderr: { resume() {} } }; },
+  });
+
+  const r = await impl.exec({ command: 'sleep 10', timeoutMs: 1 });
+
+  assert.equal(spawnOpts.detached, true, 'POSIX 上必须 detached:true，否则 child.pid 不是 PGID，kill(-pid) 会 ESRCH');
+  assert.ok(events.includes('kill(-4242,SIGKILL)'),
+    `必须对**负 pid**（进程组）发 SIGKILL；正 pid 只杀 shell、孙进程成孤儿。实际 ${JSON.stringify(events)}`);
+  assert.ok(events.includes('child.kill'), '进程组信号之后仍要兜底 kill 直接子进程');
+  assert.ok(!events.includes('UNEXPECTED-taskkill'), 'POSIX 分支不得去 spawn Windows 的 taskkill');
+  assert.equal(r.timedOut, true);
+});
+
+test('0.5.2 win32 分支仍走 taskkill，不误用进程组信号、detached 为 false', async () => {
+  const events = [];
+  let spawnOpts = null;
+  const env = { DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_EXEC_TIMEOUT_MS: '1000' };
+  const impl = createLocalTools({
+    env, config: resolveLocalConfig(env), logger: { info() {}, warn() {} },
+    platform: 'win32',
+    killFn: (pid, signal) => events.push(`kill(${pid},${signal})`),
+    spawnFn: (cmd, opts) => { spawnOpts = opts; return fakeTreeChild(events); },
+    treeKillFn: (cmd, args) => {
+      events.push(`taskkill:${cmd}:${args.join(' ')}`);
+      const handlers = {};
+      const tk = { on: (ev, fn) => { handlers[ev] = fn; }, stdout: { resume() {} }, stderr: { resume() {} } };
+      setImmediate(() => handlers.close?.(0));
+      return tk;
+    },
+  });
+
+  await impl.exec({ command: 'anything', timeoutMs: 1 });
+
+  assert.equal(spawnOpts.detached, false, 'win32 上 detached 无意义且可能改变控制台归属');
+  assert.ok(events.some((e) => e.startsWith('taskkill:taskkill:/pid 4242 /T /F')),
+    `win32 必须用 taskkill /T /F 杀树，实际 ${JSON.stringify(events)}`);
+  assert.ok(!events.some((e) => e.startsWith('kill(-')), 'win32 不得走进程组信号分支');
+});
+
 

@@ -1,5 +1,179 @@
 # Changelog
 
+## [0.5.2] - 2026-09-24
+
+0.5.1 的「已知未修」四条，本版修掉三条，第四条从「未测死代码」升级为「分支已测、内核语义仍未验证」。
+所有选型与修复都先用独立探针实测再落地，没有一条靠推断；实测脚本保留在仓库外的 `.tmpfiles/`。
+
+### ReDoS：从「冻结整个 server」到「有界阻塞」
+
+0.5.1 如实披露但未修：`local_grep` 的 pattern 是同步正则，灾难性回溯会冻住单线程事件循环，
+而 bridge-mcp 是常驻 stdio server——一次 `(a+)+$` 就把 7 个桥工具一起带走，且
+`notifications/cancelled` 对本地工具是 no-op，取消救不回来。
+
+**选型是实测出来的，两个结论都与 0.5.1 的书面判断相反**：
+
+- 0.5.1 的 README/CHANGELOG 写着「彻底修需要把遍历放进 `worker_threads` 并透传 AbortSignal，属重构」。
+  探针实测（Node v24.13.1）：`vm.runInContext(script, ctx, { timeout })` **能中断正在回溯的正则**——
+  `(a+)+$` 对 33 字符输入、`(x+x+)+y` 对 30 字符输入，原生都跑过 15000ms 需外部 `taskkill`，
+  放进 `timeout:400` 后分别在 402ms / 404ms 抛 `Script execution timed out`；抛错后**同一 context
+  与父进程 JS 均正常**。指数、多项式（20000 字符）、交替重叠、global `exec` 循环四种形状全部被中断。
+  开销实测：`runInNewContext` 约 0.43ms/次，复用 context 的 `runInContext` 约 0.095ms/次，
+  500 行真实脚本 1ms。所以**不需要 worker，也不需要把 grep 改成 async**——`vm.runInContext`
+  本身是同步的，`fsImpl` 注入 seam 与既有测试全部原样保留。
+- 更关键的是 worker 路线**反而危险**：探针里 worker 往自己 stdout 写的一行，
+  **原样出现在父进程 stdout 上**（与被 `w.stdout.on('data')` 捕获的那份并存，双重投递），
+  而本进程的 stdout 就是 JSON-RPC 信道。走 worker 会直接撞坏 MCP 协议。
+
+实现：一次 grep 建一个 `vm` context 跨文件复用；每个文件的匹配循环作为一次 `runInContext`，
+timeout 取「整次调用剩余墙上预算」（`DSH_BRIDGE_GREP_TIMEOUT_MS`，默认 10000）。
+首个文件被中断即停止整次遍历——灾难性 pattern 在后续文件上同样灾难，继续跑只是烧光预算。
+
+⚠️ **vm 不是安全边界，这里也没当边界用**：Node 文档明确说 vm 不是沙箱。脚本文本是写死的，
+不可信的 `pattern`/`lines` 只作为 contextified sandbox 上的**数据**进入，绝不做字符串插值。
+实测把 `")); process.exit(3); ("` 当 pattern 传入，得到的只是 `Invalid regular expression`。
+用 vm 只为它的 `timeout`——那是 Node 里唯一能中断正在回溯的正则的同步机制。
+
+诚实边界（README 同步写明）：`grep()` 整体仍是同步的，**预算期内事件循环依然是停的**。
+修的是「无上界冻结」→「有上界阻塞 + 到点后 server 恢复健康」，不是「不阻塞」。
+默认 10s 已接近常见 MCP `tool_timeout_sec`。取消仍是 no-op（本版未做 AbortSignal 贯穿）。
+
+实测（独立脚本 31/31）：灾难性 pattern 418ms 返回（预算 400ms）、`regexTimedOut=true`、
+`skipped.regexTimeout=1`、note 指明是灾难性回溯；中断后 120ms 内事件循环走了 9 个 tick、
+同实例后续搜索正常；8 文件树总耗时 508ms（不逐文件烧预算）；正常 pattern 零回归
+（锚点/量词/大小写/行号/`caseInsensitive` 全对，非法正则仍报 `invalid-params`）。
+
+### 默认凭据保护清单补漏
+
+0.5.1 的清单是凭直觉列的，安全评审逐条核对后指出漏项。本版实测确认**本机真实存在且当时可读**：
+`.bash_history`、Chromium `Login Data`（密码库）、Chromium `Local State`（存解密密钥）。
+
+补齐后 `PROTECTED_DIRS` 15 项（新增 `.codex`、`.claude`、`.openviking`、`.docker`、`.terraform.d`、
+`.config/gh`、`.config/gcloud`、`.config/rclone`、`.config/op`），`PROTECTED_NAME_PATTERNS` 15 条
+（新增 `.git-credentials`、`auth.json`、无扩展名 `credentials`、`credentials.db`/`.tfrc.json`、
+`secret(s).yaml|json`、`rclone.conf`、shell 与 REPL 历史家族、`Login Data`、`Local State`、`*.ppk`）。
+`.claude` 尤其值得单列：`projects/` 下是**完整会话转写**（本机 31 份），那不是配置文件而是对话记录。
+
+目录项现在支持**多段路径**（`.config/gh`），这条此前从未被验证过——既有实现只做
+`join(home, dir)`，单段名恰好能work，多段是新增能力，单独钉了用例（含「`~/.config` 本身不得被拦，
+否则一切搜索都做不了」与「`~/.config/git/config` 不得被误伤」）。
+
+误伤同样当作缺陷来测：31 个常见合法文件名必须仍可访问，包括设计系统的 `tokens.json`
+（刻意不纳入保护）、`auth.spec.ts`、`credentials.yaml.example`、`state.json`、`Dockerfile`。
+独立脚本 72/72。
+
+### 自身完整性保护（新增第五层）
+
+`local_write_file` 曾可改写 bridge-mcp 自己的源码，而生产 profile 直接
+`node <工作树>/src/server.mjs`——改写 `src/local-fs.mjs` 能永久静默移除全部防护，
+改写 `src/server.mjs` 能在下次启动时执行任意代码。那不是破坏，是**持久化**。
+
+0.5.1 把它写成「文件写权限的固有后果，无法在文件工具层设边界」。这句**是错的**：
+包根可由 `import.meta.url` 精确推出（`<pkg>/src/local-fs.mjs` 上溯两级；不能用 `process.cwd()`，
+那是 tunnel-client 的启动目录），于是边界完全可设。新增 `writeProtectedPaths`：
+包目录（可用 `DSH_BRIDGE_FS_ALLOW_SELF_WRITE=1` 解除，启动打强告警）与审计日志文件
+（**不可解除**——能被一次写调用截断清零的审计不构成控制）。只挡写不挡读：本包是公开仓库，
+源码不是秘密，挡读只妨碍正常使用而拦不住任何攻击。
+
+作用域边界是**实测**的而不是声明的：`local_exec` 开着时 `echo > src/local-fs.mjs` 就绕过了它
+（独立脚本第 7 节用注入的假包根真跑了一次 shell 重定向，确认写成功）。所以这层真正防的是
+「只开 `LOCAL_FS` 不开 shell」那个更窄配置下的唯一改写通道——而那恰好是 README 推荐的配置。
+独立脚本 39/39，含大小写/ADS/UNC/目录本身/尾分隔符五种变形，以及「白名单覆盖到本包也不解除
+自身写保护，且拒绝原因是更具体的 `self-write-protected` 而非 `path-not-allowed`」。
+
+### 白名单模式 `DSH_BRIDGE_FS_ALLOW`（新增第四层）
+
+0.5.1 只有黑名单：用户无法把网页侧访问收窄到单个项目目录，只能在「全盘可读」与
+「逐个拉黑」之间二选一，而黑名单永远列不全。
+
+语义三条，缺一不可：未设 = 不启用（零回归）；启用后所有文件工具路径与 exec 的 cwd 必须落在
+某个根的子树内；**只收窄、永不放宽**——与凭据保护是 AND 关系而非替代。第三条是设计红线：
+若白名单能放宽保护，那「把 home 加进白名单」就等于一键解除全部凭据保护，这个开关本身会变成
+自毁按钮。用例专门钉住：白名单设为 home 时，桥 token / `.ssh/id_rsa` / `.codex/auth.json` /
+`.bash_history` 仍全部 `credential-protected`。
+
+绕过向量逐个实测（独立脚本 45/45，junction 那条在 Windows 上真跑通、未跳过）：
+`..` 穿越以 canonical 结果判定（逃不出去，但从外部经 `..` 合法走进白名单内**必须放行**，
+否则用户写相对路径就处处碰壁）；大小写 / NTFS ADS / UNC 变形不得进出；junction 指向白名单外时
+读取被拒、递归列举不收录、递归 grep 读不出内容；多根用 `path.delimiter` 分隔；
+白名单根写成大写时内部正常路径仍可访问（用户常从资源管理器复制路径）。
+递归遍历内**逐条目**生效（`guardWalkEntry`），不是只查搜索根——这正是 0.5.0 被打穿的那条纪律。
+
+### 本版自查发现的两个真 bug（都在实现过程中被自己的验证脚本抓到）
+
+- **`writeProtectedPaths` 没对 `selfRoot` 做 canonical**：auditFile 那一项做了，selfRoot 原样入清单。
+  而 `guardPath` 拿来比的 `abs` 是 canonical（Windows 下小写），于是**注入的 selfRoot 永不相等、
+  保护静默失效**。默认路径侥幸没事（`selfPackageRoot()` 自己返回 canonical）。
+  这与 0.5.1 的 `guardWalkEntry` 漏 canonical 是**同一类错误的第二次复发**，所以单独钉了一条用例，
+  用混合大小写的注入路径断言必须拦住。
+- **审计落盘挂在默认 logger 上**：`auditSink` 只在 `deps.logger` 缺省时才被调用，
+  于是任何注入了 logger 的调用方都会**静默丢掉落盘审计**——而审计是这条链路对外宣称的
+  唯一补偿性控制，不该随依赖注入方式消失。改为独立的 `audit()` 通道，与 logger 解耦；
+  用例用一个「什么都不做」的 logger 断言审计仍然落盘。
+
+### 审计行防注入 + exec 并发闸
+
+- **审计行可被伪造**：0.5.1 的 AUDIT 行是 `key=value` 直接拼接，而 `command` 与 `path` 都是
+  调用方可控的自由文本。命令里带一个换行就能凭空造出或抹掉审计记录。改为 JSON-string 兼容的
+  带引号转义（转义 `\ " CR LF TAB`），`JSON.parse` 可无损还原原文；实测注入
+  `dir` + LF + `AUDIT local_exec … exit=0 … command="rm -rf /"` 后落盘仍**只有 1 行**，
+  且原文可完整还原。代价是 Windows 路径反斜杠翻倍（`d:\\git\\…`），人眼仍可读。
+- **`local_exec` 无并发上限**：云端会话可一次扇出任意多条命令，每条都能跑满 `execTimeoutMs`，
+  而同进程还服务着 7 个桥工具。新增 `DSH_BRIDGE_EXEC_MAX_CONCURRENT`（默认 4），
+  超限**立即**报 `exec-busy` 而非静默排队（排队会让调用方以为命令在跑，队列本身又是新的无界资源）。
+  额度在 `close`/`exit`/超时/输出超限各路径上恰好归还一次——用例专门覆盖「超时之后额度必须已归还」，
+  因为重复归还会让计数变负、闸门永久失效。
+
+### 其它
+
+- **`local_exec` 不传 `cwd` 曾是绕过后门**：0.5.1 只在 `args.cwd` 存在时才 guard，
+  于是「不传 cwd」直接把 `defaultCwd` 原样交给子进程，白名单与三级保护全不过。
+  改为 `guard(args.cwd ?? config.defaultCwd, 'exec')`；`local_grep` 的默认根同理。
+- **`onlyMatching` 的命中片段现在也截到 500 字符**：0.5.1 只截整行分支，
+  压缩后的单行 JS 一条命中就能带回 maxBytes 量级的内容，×maxMatches 就是几十 MB 回执。
+- **POSIX 进程组终止：从「未测死代码」到「分支已测」**。本机无 Linux/macOS，且实测
+  `wsl.exe -l -v` 返回「没有已安装的分发版」，所以**内核语义无法验证**，继续标未验证。
+  但把 `platform` 与信号发送函数做成可注入后，代码路径有了覆盖：断言 POSIX 下
+  `detached:true`、对 **负 pid** 发 `SIGKILL`（正 pid 只杀 shell、孙进程成孤儿）、
+  兜底 kill 仍执行、不去 spawn `taskkill`；以及 win32 下 `detached:false` 且仍走
+  `taskkill /pid … /T /F`、不误用进程组信号。
+- 回执新增字段：`regexTimedOut`、`wallTimedOut`、`elapsedMs`、`regexMs`、`grepTimeoutMs`、
+  `skipped.regexTimeout`。`limitTruncated` 语义**未变**（仍只表示命中数/文件数触顶）——
+  把超时也算进去会让调用方以为「收紧 limit 就能解决」，而真因是 pattern。
+- README 新增一条 0.5.1 就该披露却漏了的残余风险：**审计文件自己会变成秘密存储**。
+  审计记的是命令原文（设计如此：命令不是秘密，输出才是），但现实里命令常内联秘密
+  （`curl -H "Authorization: Bearer …"`、`mysql -pPASSWORD`、`git clone https://user:token@…`），
+  这些会逐字落盘。`DSH_BRIDGE_AUDIT_FILE` 因此要按凭据来管。
+
+### 验证
+
+离线 **160/160**（0.5.1 的 122 + 本版新增 38 条钉子，逐条对应上述缺陷与边界）。
+四个独立验证脚本全绿：ReDoS 31/31、凭据保护 72/72、自身写保护 39/39、白名单 45/45。
+
+0.5.1 的三个复现脚本重跑，结论未回退：`verify-sec` **0 / 6 指控成立**、
+`verify-corr` **0 / 6**、`repro-p12` 指控不成立；活体端到端 `live-verify` **32/32**
+（四场景：门控关闭与生产完全一致 / 只开文件 / 文件+exec 全开含真跑命令与桥侧 capabilities
+仍打通 43120 / 解除默认保护后 `.env` 可读但桥 token 仍强制不可读）。
+
+重跑过程中发现**三个复现脚本自身的 bug**，一并修掉——它们不影响 0.5.2 的结论，
+但曾让 0.5.1 的部分「证据」名不副实：
+
+- `verify-corr/repro.mjs` 的 B-P1-2 节把 `join(process.cwd(), …)` 得到的**裸 Windows 路径**
+  直接交给子进程的 `await import()`。带盘符的路径不是合法 URL，必然抛
+  `ERR_UNSUPPORTED_ESM_URL_SCHEME`——子进程在 import 阶段就死了，**从未走到 treeKill**，
+  脚本却报「✗ 崩溃成立」。也就是说这一节从来没真正测到目标路径；若当时采信该输出，
+  会得出「0.5.1 的 error 监听修复无效」的错误结论。已改用 file: URL，并加自检：
+  stdout 既无 `SURVIVED` 也无 `UNCAUGHT` 时判定探针失效、计入 confirmed。修后 ✓ 未崩溃。
+  （该修复真正的证据一直是套件里的 `0.5.1 treeKillFn 的 spawn 失败不得崩掉宿主` 与已修好的 `repro-p12`。）
+- `verify-sec` 的目录模式断言写的是 `filesScanned === 0`，但脚本前几节已往同一个临时目录建过文件，
+  那些小文件被**合法**扫描，`=1` 才是正确行为。改为断言 `skipped.oversize === 1`
+  （8MB 文件确实被计入超限跳过）。另用独立探针实测三种目录构成，确认不是回归：
+  只有大文件时 `filesScanned=0/oversize=1`；大文件+小文件时 `1/1`；单文件模式 rssΔ 无增长
+  （0.5.0 曾 +392MB）。
+- `live-verify` 的 `serverInfo` 版本断言**硬编码 `'0.5.0'`**，0.5.1 发版时没跟着改，
+  于是它从 0.5.1 起就一直是 FAIL 而行为断言全绿。改为从 `package.json` 读取——
+  过期断言比没有断言更糟，因为它会让人以为又坏了什么。
+
 ## [0.5.1] - 2026-09-24
 
 ### 安全修复：0.5.0 的凭据保护可被两条独立路径完全绕过

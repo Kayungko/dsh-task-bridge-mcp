@@ -137,10 +137,24 @@ tool_timeout_sec = 60          # wrapper 的 wait 工具已按 50s 上限钳制�
 | `DSH_BRIDGE_EXEC_TIMEOUT_MS` | `local_exec` 超时上限（入参只能调小不能调大） | `30000` |
 | `DSH_BRIDGE_GREP_MAX_FILES` | `local_grep` 扫描文件数上限 | `2000` |
 | `DSH_BRIDGE_GREP_MAX_DEPTH` | `local_grep` / 递归列举深度上限 | `12` |
-| `DSH_BRIDGE_LOCAL_CWD` | 本地工具的缺省工作目录 | bridge-mcp 进程 cwd |
+| `DSH_BRIDGE_GREP_TIMEOUT_MS` | `local_grep` **整次调用的墙上时间预算**；到点即停并置 `regexTimedOut`/`wallTimedOut` | `10000` |
+| `DSH_BRIDGE_EXEC_MAX_CONCURRENT` | `local_exec` 同时在跑的命令数上限；超限立即报 `exec-busy`（不排队） | `4` |
+| `DSH_BRIDGE_LOCAL_CWD` | 本地工具的缺省工作目录（同样受白名单与凭据保护约束） | bridge-mcp 进程 cwd |
 | `DSH_BRIDGE_FS_DENY` | 追加路径黑名单（`path.delimiter` 分隔，按目录前缀匹配） | 不设置 |
+| `DSH_BRIDGE_FS_ALLOW` | **白名单模式**：设置后所有文件工具路径与 exec 的 cwd 必须落在列出的根内（`path.delimiter` 分隔，可多根） | 不设置（不限范围） |
 | `DSH_BRIDGE_FS_DENY_CREDENTIALS` | `=0` 解除默认凭据保护（启动打强告警） | 保护开启 |
-| `DSH_BRIDGE_AUDIT_FILE` | 审计行落盘路径（append-only，一行一条） | 不落盘，仅 stderr |
+| `DSH_BRIDGE_FS_ALLOW_SELF_WRITE` | `=1` 解除「禁止改写 bridge-mcp 自身包目录」保护（启动打强告警） | 保护开启 |
+| `DSH_BRIDGE_AUDIT_FILE` | 审计行落盘路径（append-only，一行一条；该文件本身**不可被 `local_write_file` 改写**，且此项保护不可解除） | 不落盘，仅 stderr |
+
+> ⚠️ **白名单只收窄、永不放宽**。`DSH_BRIDGE_FS_ALLOW` 与凭据保护是 **AND** 关系：把 home
+> 加进白名单，`~/.dsh/task-bridge-token`、`~/.ssh/id_rsa`、`~/.codex/auth.json` 照样被拒。
+> 它也**管不住 `local_exec`**——命令里用绝对路径（`type C:\...`）想读哪读哪。真要收窄到
+> 单个项目，正确做法是只开 `DSH_BRIDGE_LOCAL_FS`、不开 `DSH_BRIDGE_LOCAL_EXEC`，再设白名单。
+
+> ⚠️ **`DSH_BRIDGE_GREP_TIMEOUT_MS` 是「有界阻塞」不是「不阻塞」**。`local_grep` 是同步实现，
+> 正则执行期间事件循环仍然是停的；这个预算把停顿从**无上界**（0.5.1 实测 `(a+)+$` 跑过 15s
+> 需外部 `taskkill`）压到**有上界且到点后 server 恢复健康**。默认 10s 已接近常见 MCP
+> `tool_timeout_sec`，调大前请确认客户端的超时设置。
 
 > ⚠️ **别指望 stderr 能当审计留痕**：安全评审实测生产 `tunnel-client.log`（3.9MB debug 级、
 > 覆盖两次启动）对 bridge-mcp 的 stderr **零命中**——profile 的 `mcp.commands[]` 只有
@@ -242,25 +256,61 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
 读写文件、执行命令。与 `dsh_task_*` 的最坏情况（"派了个任务"——任务在 DSH 里可见、可 steer 可 cancel，但**派发本身不经确认卡**，只有 60s/10 次策略闸）不同，
 这里的最坏情况是"仓库被改、命令被执行、文件被读走"。
 
-因此实现内置了四层防护，**不是可选项**：
+因此实现内置了六层防护，**不是可选项**：
 
 1. **默认关闭 + 两个独立开关**：不显式 opt-in 就一个工具都不注册。
 2. **本链路凭据强制不可读写**：`~/.dsh/task-bridge-token`（或 `TASK_BRIDGE_TOKEN_FILE`
    指向的路径）与 `~/.dsh/.credentials.yaml` 一律拒绝，**且不可通过任何配置解除**——
    这条只约束 `local_*` **文件工具的路径参数**（含递归遍历中遇到的每个条目，0.5.1 起）。
    ⚠️ 一旦开了 `DSH_BRIDGE_LOCAL_EXEC=1`，同一条命令（`type` / `Get-Content` / `node -e` /
-   `certutil -encode`）就能直接读出这些文件，第 ②③ 层保护对 exec **不成立**。这不是实现缺陷
+   `certutil -encode`）就能直接读出这些文件，第 ②③④⑤ 层保护对 exec **不成立**。这不是实现缺陷
    而是 shell 的固有性质：给了 shell 就没有文件级边界可言。所以「开 exec」的代价要按
    「交出本机全部读权限」来估，不要按「文件工具那套保护还在」来估。
    理由：读走它们等于凭据永久留在云端对话记录里，属自毁而非能力。拒绝时不回吐任何文件内容。
-3. **默认凭据保护**（可用 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0` 显式解除，解除时启动打强告警）：
-   `~/.ssh`、`~/.aws`、`~/.azure`、`~/.gnupg`、`~/.kube` 整棵树，以及 `.env`/`.env.*`、
-   `id_rsa`/`id_ed25519`、`*.pem`/`*.p12`/`*.pfx`/`*.key`、`credentials.json|yaml`、
-   `kubeconfig`/`netrc`/`pgpass`/`npmrc`/`pypirc` 类文件名。
-4. **写与执行每次都写审计日志**（stderr，tunnel-client 日志会收）：
-   `AUDIT local_write_file path=… mode=… existed=… previousSize=… newSize=…`、
+3. **默认凭据保护**（可用 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0` 显式解除，解除时启动打强告警）。
+   0.5.2 按安全评审逐条核对的结果补齐了漏项——原来那份清单是凭直觉列的，漏掉了多个
+   **本机实测存在且当时可读**的位置。现在覆盖：
+   - 目录树：`~/.ssh`、`~/.aws`、`~/.azure`、`~/.gnupg`、`~/.kube`、`~/.dsh`、
+     `~/.codex`（`auth.json`）、`~/.claude`（`settings.json` 可含 env 秘密；`projects/` 下是
+     **完整会话转写**）、`~/.openviking`（`ov.conf` 含模型端点与凭据配置）、`~/.docker`、
+     `~/.terraform.d`、`~/.config/gh`（`hosts.yml` 里的 `oauth_token`）、`~/.config/gcloud`、
+     `~/.config/rclone`、`~/.config/op`
+   - 文件名：`.env`/`.env.*`、`id_rsa`/`id_ed25519` 类、`*.pem`/`*.p12`/`*.pfx`/`*.key`/`*.ppk`、
+     `credentials.json|yaml`、无扩展名的 `credentials`、`credentials.db`/`credentials.tfrc.json`、
+     `auth.json`、`secret(s).yaml|json`、`rclone.conf`、`.git-credentials`、
+     `kubeconfig`/`netrc`/`pgpass`/`npmrc`/`pypirc`、
+     shell 与 REPL 历史（`.bash_history`/`.zsh_history`/`.psql_history`/`.lesshst` 等——
+     人手粘贴过的 token 会长期留在这里）、Chromium 系 `Login Data` 与 `Local State`
+
+   刻意**没有**纳入的常见误伤项：`tokens.json`（设计系统的 design tokens）、`auth.spec.ts`、
+   `credentials.yaml.example`、`state.json`。完整清单见 `src/local-fs.mjs` 的
+   `PROTECTED_DIRS` / `PROTECTED_NAME_PATTERNS`，两者都有逐条测试钉子。
+4. **白名单模式**（`DSH_BRIDGE_FS_ALLOW`，0.5.2）：设置后所有文件工具路径与 exec 的 cwd
+   必须落在列出的根内，`..` 穿越、大小写/ADS/UNC 变形、junction 逃逸一律以 canonical
+   结果判定；递归遍历内**逐条目**生效（不是只查搜索根）。与第 ②③ 层是 AND 关系——
+   **只收窄、永不放宽**。⚠️ 管不住 `local_exec` 命令里的绝对路径。
+5. **自身完整性保护**（0.5.2）：`local_write_file` 不得改写 bridge-mcp **自己的包目录**
+   （含 append 与新建文件），也不得改写审计日志文件。生产 profile 直接
+   `node <工作树>/src/server.mjs`，所以改写 `src/local-fs.mjs` 能永久静默移除全部防护、
+   改写 `src/server.mjs` 能在下次启动时执行任意代码——那不是破坏，是**持久化**。
+   读仍然放行（本包是公开仓库，源码不是秘密；挡读只妨碍正常使用）。
+   包目录这项可用 `DSH_BRIDGE_FS_ALLOW_SELF_WRITE=1` 解除（启动打强告警）；
+   **审计文件那项不可解除**——能被一次写调用截断清零的审计不构成控制。
+   ⚠️ 作用域边界是**实测**得出的：exec 开着时 `echo > src/local-fs.mjs` 就绕过了它，
+   所以这层真正防的是「只开 `LOCAL_FS` 不开 shell」那个更窄配置下的唯一改写通道。
+6. **写与执行每次都写审计日志**：
+   `AUDIT local_write_file path=… mode=… existed=… previousSize=… writtenBytes=…`、
    `AUDIT local_exec cwd=… timeoutMs=… exit=… timedOut=… command=…`。
    记路径与命令原文（都不是秘密），**绝不记文件内容与命令输出**（可能含敏感数据）。
+   0.5.2 两处加固：① 自由文本字段改为 JSON-string 兼容的带引号转义，命令里的换行**不能
+   再伪造额外审计行**（原来一次注入就能凭空造出或抹掉一条记录，而审计是这条链路宣称的
+   唯一补偿性控制）；② 落盘与 logger 解耦——0.5.1 把落盘挂在默认 logger 上，注入 logger
+   就会静默丢掉审计。stderr 在生产部署下不进 tunnel-client 日志，要留痕必须设
+   `DSH_BRIDGE_AUDIT_FILE`（见上）。
+
+此外还有两条**有界性**约束（0.5.2），防止单次调用把宿主拖死：`local_grep` 有整次调用的
+墙上时间预算（`DSH_BRIDGE_GREP_TIMEOUT_MS`，默认 10s），`local_exec` 有并发上限
+（`DSH_BRIDGE_EXEC_MAX_CONCURRENT`，默认 4，超限立即返回 `exec-busy` 而非静默排队）。
 
 ### 怎么设这些开关（三种部署形态各不相同，别照抄）
 
@@ -306,16 +356,52 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
   这就是句柄泄漏。
 - 另监听 `exit` 作为兜底（250ms 缓冲让已收数据落地）：宁可少几个尾字节，也不能让工具调用永久
   挂起（那会撞穿 MCP `tool_timeout_sec`，表现成"整个会话卡死"）。
-- `local_grep` 的**文件数上限**（`DSH_BRIDGE_GREP_MAX_FILES`）与**命中数上限**（`limit`，clamp 到 5000）超限会置 `truncated` / `limitTruncated`；**深度上限**（`DSH_BRIDGE_GREP_MAX_DEPTH`，默认 12）到顶置 `depthLimited`（0.5.0 是静默停止下潜，`truncated:false` 会被读成「整棵树搜全了」）。
+- `local_grep` 有四重上界：**文件数**（`DSH_BRIDGE_GREP_MAX_FILES`）、**命中数**（`limit`，clamp 到 5000）超限会置 `truncated` / `limitTruncated`；**深度**（`DSH_BRIDGE_GREP_MAX_DEPTH`，默认 12）到顶置 `depthLimited`（0.5.0 是静默停止下潜，`truncated:false` 会被读成「整棵树搜全了」）；**整次墙上时间**（`DSH_BRIDGE_GREP_TIMEOUT_MS`，默认 10000，0.5.2 新增）到点即停，并按原因分别置 `regexTimedOut`（正则灾难性回溯被 `vm` 强制中断）与 `wallTimedOut`（树太大/磁盘太慢），回执另带 `elapsedMs` / `regexMs` / `skipped.regexTimeout`。两种超时刻意分开报：前者要改写 pattern，后者要收窄 path，混成一个标志会让调用方修错方向。
+- `local_exec` 有并发上限（`DSH_BRIDGE_EXEC_MAX_CONCURRENT`，默认 4，0.5.2 新增）：超限**立即**返回 `code=exec-busy` 而不是静默排队——排队会让调用方以为命令在跑，而队列本身又是新的无界资源。额度在 `close`/`exit`/超时/输出超限各条路径上都恰好归还一次（有专门用例钉住，重复归还会让计数变负、闸门失效）。
 - 被跳过的文件逐项计数并如实上报：`skipped.{oversize,binary,protected,unreadable}`，且**只要有跳过就置 `truncated=true`** 并给出 `note`——0.5.0 把超限/二进制文件静默 `continue` 却仍计入 `filesScanned`，于是「扫了 N 个、只有 1 处命中、没截断」无法区分"确实没有"与"被跳过了"。`local_list_dir` 同理报 `skippedProtected` / `depthLimited`。
 - 单文件模式（`path` 指向文件）与目录模式共用同一套 size / 二进制闸门（0.5.0 的单文件分支两者都没有：实测 `maxBytes=1024` 时仍把 200MB 文件整体读入堆，rss +392MB）。
 
-### 已知未修（0.5.1 如实披露，别按"已加固"来估风险）
+### 已知未修（0.5.2 如实披露，别按"已加固"来估风险）
 
-- **`local_grep` 的 pattern 是同步正则，恶意或失误的 pattern 可冻结整个 server**。安全评审实测 `(a+)+b` 对 28 个 `a` 呈指数增长（n=18→12ms、n=26→446ms、n=28→1760ms），期间 5ms 心跳 tick 归零即事件循环完全冻结；而 `notifications/cancelled` 的 abort signal 只传给桥的 fetch，本地工具 handler 忽略 `_client`，**取消对它是 no-op**。后果是 7 个 `dsh_task_*` 工具的响应、心跳与 `dsh_task_wait` 一起停摆，撞穿 MCP `tool_timeout_sec`，表现成「整个会话卡死」。触发不需要恶意——提示注入让模型发一个带嵌套量词的正则即可，模型自己写错也可能命中。彻底修需要把遍历放进 `worker_threads` 并透传 AbortSignal，属重构，本版未做。**规避**：pattern 避免嵌套量词（`(a+)+`、`(a|a)*`）；不确定时改用 `local_read_file` 配 offset/limit 直接看文件；不要把 `DSH_BRIDGE_LOCAL_FS` 开在无人看管的常驻链路上。
-- **默认凭据保护清单仍有漏项**（安全评审逐个实测本机存在且可读）：`~/.codex/auth.json`、`~/.config/gh/hosts.yml`、`~/.bash_history`、`~/.claude/settings.json`、`~/.openviking/ov.conf`、`~/.git-credentials`、`~/.docker/config.json`、浏览器 `Login Data`（被二进制闸门挡住 readFile 路径，但开 exec 后可绕过）。请用 `DSH_BRIDGE_FS_DENY` 自行收窄；更彻底的 `DSH_BRIDGE_FS_ALLOW` 白名单模式（只允许写指定根）尚未实现。
-- **`local_write_file` 可写 bridge-mcp 自身源码**：生产 profile 直接 `node <工作树>/src/server.mjs`，所以改写 `src/local-fs.mjs` 能永久静默移除全部防护、改写 `src/server.mjs` 能在下次启动时执行任意代码（该进程可读真 token、能打桥）。这是文件写权限的固有后果，无法在文件工具层设边界；要收窄请用 `DSH_BRIDGE_FS_DENY` 把仓库目录拉黑，或改用 `npm i -g` 的拷贝安装形态（代码落在用户目录而非工作树）。
-- **POSIX 的进程组终止未实测**：本机无 Linux/macOS/WSL 环境，`detached: true` + `process.kill(-pid)` 这条路径只有代码审查与语义推理支撑，标 **未验证**。Windows 的 `taskkill /T /F` 已实测有效（孙进程存活 5800ms → 600ms）。
+0.5.1 这一节列的四条，三条已在 0.5.2 修掉（ReDoS、凭据清单漏项、可改写自身源码），
+第四条（POSIX 进程组终止）从「未测死代码」升级为「分支已测、内核语义仍未验证」。
+以下是**修完之后仍然成立**的残余风险，按重要性排列：
+
+- **开了 `local_exec`，所有文件级边界归零**。凭据保护、白名单、自身完整性保护全都是
+  **文件工具层**的约束，而 shell 不受它们管：`type C:\Users\you\.ssh\id_rsa`、
+  `echo x > <工作树>\src\local-fs.mjs`、`curl` 外传，一条命令就够。这不是实现缺陷而是
+  「给出 shell」的定义本身。所以启用梯度只有一条正确读法：**`LOCAL_FS` 单独开 = 有边界；
+  `LOCAL_EXEC` 一开 = 没有边界**。别把六层防护当成开了 exec 之后还在生效。
+- **`local_grep` 是「有界阻塞」，不是「不阻塞」，而且取消仍是 no-op**。0.5.2 把正则执行放进
+  `vm.runInContext(…, { timeout })`，实测能中断灾难性回溯（`(a+)+$` 对 33 字符输入：原生跑过
+  15000ms 需外部 `taskkill` → 现在 418ms 中断并如实置 `regexTimedOut`），中断后事件循环恢复、
+  同实例后续调用正常。但 `grep()` 整体是同步的，**预算期内事件循环仍然是停的**：默认 10s
+  已接近常见 MCP `tool_timeout_sec`，调大前请确认客户端超时。另外 `notifications/cancelled`
+  的 abort signal 只透传给桥的 fetch，本地工具 handler 忽略 `_client`——**取消对本地工具依然
+  无效**，它只会跑到自己的预算为止。本版没有做 AbortSignal 贯穿。
+- **`vm` 的中断行为只在 Node v24.13.1 上实测过**。`engines` 声明 `>=18.17`，而「timeout 能
+  中断 irregexp 回溯」依赖 V8 的中断检查点，我没有 18/20/22 的环境去测。若在旧版本上退化成
+  「不能中断」，表现就是回到 0.5.1 的冻结行为——**不会更糟，但保护会静默失效**。
+  换 Node 大版本后建议重跑一次 `local_grep` 的灾难性 pattern 用例。
+- **默认凭据保护仍然是黑名单，本质上列不全**。0.5.2 补的是安全评审逐个实测到的漏项，
+  不等于穷举：小众工具的凭据位置、项目内自定义的秘密文件、非标准路径一律不在清单里。
+  要真正的收窄请用 `DSH_BRIDGE_FS_ALLOW` 白名单（只放行指定根），而不是继续往黑名单上加项。
+- **审计文件自己会变成秘密存储**。审计行记的是**命令原文**（这是设计：命令不是秘密，
+  输出才是）。但现实里命令经常内联秘密——`curl -H "Authorization: Bearer xxx"`、
+  `mysql -pPASSWORD`、`git clone https://user:token@…`。这些会**逐字落进审计文件**。
+  所以 `DSH_BRIDGE_AUDIT_FILE` 要按凭据来管：放在只有本用户可读的位置，别提交进仓库、
+  别塞进会被 `local_grep` 扫到的项目目录。这一条 0.5.1 就该写，当时漏了。
+- **POSIX 的进程组终止：内核语义未验证**。本机无 Linux/macOS，且 `wsl.exe -l -v` 返回
+  「没有已安装的分发版」，所以**无法实测**。0.5.2 把 `platform` 与信号发送函数做成可注入，
+  于是这条分支的**代码路径**有了单测覆盖（断言 `detached:true`、对 `-pid` 发 `SIGKILL`、
+  兜底 kill 仍执行、不去 spawn `taskkill`），把「未测死代码」降级为「分支已测」。
+  但「Linux 内核确实会因此杀掉整棵进程树」这一步仍标 **未验证**。Windows 的
+  `taskkill /T /F` 已实测有效（孙进程存活 5800ms → 600ms）。
+- **symlink 逃逸只实测了 Windows junction**。白名单与递归保护对 junction 的逃逸已实测拦住；
+  POSIX 的 symlink 只有代码路径推理支撑（`canonical` 走 `realpathSync.native`，语义上应一致），
+  标 **未验证**。
+- **`local_write_file` 没有并发/速率闸**。0.5.2 给 `local_exec` 加了并发上限，写文件没有——
+  一次扇出几百个写调用不会被拦。危害小于 exec（写有审计、有路径保护），但仍是无界资源。
 
 ## 安全注意事项
 
