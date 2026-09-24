@@ -3,15 +3,18 @@
 // 因为 shell 行为在 Windows(cmd.exe) 与 POSIX 上不同，mock 会掩盖真实差异。
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   buildLocalTools,
   buildLocalInstructions,
+  buildExecEnv,
+  canonical,
   createLocalTools,
   guardPath,
+  guardWalkEntry,
   isProtectedByDefault,
   protectedAlways,
   resolveLocalConfig,
@@ -217,7 +220,8 @@ test('保护：桥自己的 token 文件强制不可读，且不可通过 env �
       assert.match(e.message, /不可通过配置解除/);
     }
   }
-  assert.ok(protectedAlways({}).includes(tokenPath));
+  // protectedAlways 返回 canonical（小写 + 解析真实路径）形式，比较必须两侧同形
+  assert.ok(protectedAlways({}).includes(canonical(tokenPath)), `应含 ${tokenPath}`);
 });
 
 test('保护：TASK_BRIDGE_TOKEN_FILE 指向的自定义路径同样受强制保护', () => {
@@ -244,7 +248,7 @@ test('保护：TASK_BRIDGE_TOKEN_FILE 指向的自定义路径同样受强制保
 
 test('保护：DSH 宿主凭据 .credentials.yaml 强制不可读', () => {
   const credPath = join(homedir(), '.dsh', '.credentials.yaml');
-  assert.ok(protectedAlways({}).includes(credPath));
+  assert.ok(protectedAlways({}).includes(canonical(credPath)), `应含 ${credPath}`);
   const { impl } = makeImpl();
   try {
     impl.readFile({ path: credPath });
@@ -331,7 +335,10 @@ test('writeFile：新建文件、递归建父目录、回执如实报告 existed
   // 审计日志：记路径与字节数，绝不记内容
   assert.equal(logs.info.length, 1);
   assert.match(logs.info[0], /^AUDIT local_write_file /u);
-  assert.match(logs.info[0], /mode=overwrite existed=false previousSize=0 newSize=11/);
+  // 0.5.1：审计行**前置于 statSync**，所以记的是 writtenBytes（按内容算，无需 stat）而非 newSize。
+  // 这样「写已落盘但 stat 抛错」时审计行不会丢——0.5.0 在该场景下 0 条审计。
+  assert.match(logs.info[0], /mode=overwrite existed=false previousSize=0 writtenBytes=11/);
+  assert.match(logs.info[0], /^AUDIT local_write_file path=C:/u, '路径须保留 OS 正确大小写，不能是 canonical 的小写形式');
   assert.ok(!logs.info[0].includes('hello world'), '审计日志不得含文件内容');
 });
 
@@ -787,3 +794,414 @@ test('server：initialize 的 instructions 随启用集合变化', () => {
   );
   assert.match(withLocal.result.instructions, /local_read_file 纪律/);
 });
+
+// ---------------------------------------------------------------------------
+// 0.5.1 回归钉子：四路评审发现的缺陷，每条一个用例
+//
+// 元教训：0.5.0 的 51 个用例全绿却给出**假信心**——所有凭据保护断言都只走
+// readFile/writeFile，没有任何用例断言 grep/listDir 的递归遍历也遵守保护。
+// 于是「一次 local_grep(path=父目录) 读出 token 原文」这条最短攻击路径完全漏网。
+// 以下用例逐条钉住评审复现成立的缺陷。
+// ---------------------------------------------------------------------------
+
+// 本文件既有的隔离设施是模块级 TMP + writeScript；0.5.1 这批用例需要「每例独占目录」，
+// 因为递归遍历类断言对目录内容敏感（任何其他用例的残留文件都会污染 skipped 计数）。
+function makeTempDir() {
+  return mkdtempSync(join(tmpdir(), 'dsh-local-fs-051-'));
+}
+function cleanup(dir) {
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* 尽力清理 */ }
+}
+
+test('0.5.1 递归遍历必须遵守凭据保护：grep 不得读出受保护文件内容', (t) => {
+  // 这是 0.5.0 最严重的缺陷（安全与正确性评审各自独立复现）：guardPath 只作用于搜索根，
+  // walk 内对发现的文件从不检查，且 README 推荐的「只开文件不开 shell」恰恰是绕过生效的配置。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const secretFile = join(dir, 'task-bridge-token');
+  writeFileSync(secretFile, 'SYNTHETIC-FAKE-SECRET-must-not-leak', 'utf8');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', TASK_BRIDGE_TOKEN_FILE: secretFile };
+  const { impl } = makeImpl(env);
+
+  const r = impl.grep({ pattern: 'SYNTHETIC-FAKE-SECRET', path: dir });
+
+  assert.equal(r.matchCount, 0, '受保护文件的内容绝不能出现在命中里');
+  assert.ok(!JSON.stringify(r.matches).includes('must-not-leak'), '回执任何字段都不得含秘密片段');
+  assert.equal(r.skipped.protected, 1, '必须如实报告「因保护跳过 1 个」，不能静默');
+  assert.equal(r.truncated, true, '有跳过即结果不完整，truncated 必须为 true');
+  assert.match(r.note, /凭据保护 1/, 'note 要说明跳过原因与数量');
+});
+
+test('0.5.1 递归遍历必须遵守默认保护与用户黑名单（.env / DSH_BRIDGE_FS_DENY）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  writeFileSync(join(dir, '.env'), 'DB_PASSWORD=SYNTHETIC-FAKE-999', 'utf8');
+  writeFileSync(join(dir, 'normal.mjs'), 'DB_PASSWORD=public-default', 'utf8');
+  const vault = join(dir, 'vault');
+  mkdirSync(vault, { recursive: true });
+  writeFileSync(join(vault, 'notes.txt'), 'SYNTHETIC-FAKE-vault', 'utf8');
+
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_DENY: vault };
+  const { impl } = makeImpl(env);
+  const r = impl.grep({ pattern: 'SYNTHETIC-FAKE|DB_PASSWORD', path: dir });
+
+  const paths = r.matches.map((m) => m.path);
+  assert.ok(!paths.some((p) => p.endsWith('.env')), '.env 不得被递归搜出');
+  assert.ok(!paths.some((p) => p.includes('vault')), '黑名单目录下的文件不得被搜出');
+  assert.ok(paths.some((p) => p.endsWith('normal.mjs')), '正常文件仍要能搜到（不能因加固而失能）');
+  assert.equal(r.skipped.protected, 2, '.env + vault/notes.txt 两个跳过都要计数');
+});
+
+test('0.5.1 listDir 递归不得暴露受保护文件路径', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const secretFile = join(dir, 'task-bridge-token');
+  writeFileSync(secretFile, 'SYNTHETIC-FAKE', 'utf8');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', TASK_BRIDGE_TOKEN_FILE: secretFile };
+  const { impl } = makeImpl(env);
+
+  const r = impl.listDir({ path: dir, recursive: true });
+
+  assert.ok(!r.entries.some((e) => e.name === 'task-bridge-token'), '路径本身就是信息，不得列出');
+  assert.equal(r.skippedProtected, 1);
+  assert.match(r.note, /凭据保护\/黑名单被跳过/);
+});
+
+test('0.5.1 不得把受保护目录当搜索根（祖先前缀匹配）', (t) => {
+  // 0.5.0 的 protectedAlways 只做精确匹配，于是 guardPath(~/.dsh) 放行，
+  // 攻击者可直接把 token 所在目录当 grep 根。
+  const dshDir = join(homedir(), '.dsh');
+  assert.throws(() => guardPath(dshDir, { op: 'read' }), (e) => e.code === 'credential-protected',
+    '受保护目录本身必须被拒（它包含强制保护的凭据文件）');
+});
+
+test('0.5.1 canonical 化挡住四类路径变形（大小写 / ADS / UNC / symlink）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const secretFile = join(dir, 'fake-token.txt');
+  writeFileSync(secretFile, 'SYNTHETIC-FAKE-canonical', 'utf8');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', TASK_BRIDGE_TOKEN_FILE: secretFile };
+  const { impl } = makeImpl(env);
+
+  // canonical 的语义：同一文件的不同写法收敛成唯一形式
+  assert.equal(canonical(join(dir, 'FAKE-TOKEN.TXT')), canonical(secretFile), '大小写变形必须收敛');
+  assert.equal(canonical(`${secretFile}::$DATA`), canonical(secretFile), 'NTFS 备用数据流必须被剥掉');
+
+  const denied = (label, p) => {
+    try {
+      const r = impl.readFile({ path: p });
+      assert.fail(`${label} 应当被拒，实际读到：${String(r.content).slice(0, 40)}`);
+    } catch (e) {
+      assert.equal(e.code, 'credential-protected', `${label} 应回 credential-protected，实际 ${e.code}`);
+    }
+  };
+  denied('文件名大写', secretFile.replace('fake-token.txt', 'FAKE-TOKEN.TXT'));
+  denied('全小写', secretFile.toLowerCase());
+  denied('ADS ::$DATA', `${secretFile}::$DATA`);
+  denied('UNC \\\\?\\', `\\\\?\\${secretFile}`);
+
+  // symlink：链接自身路径与目标字面不同，必须靠 realpath 解析后拦截
+  const link = join(dir, 'link-to-secret');
+  try {
+    symlinkSync(secretFile, link);
+    denied('symlink', link);
+  } catch (e) {
+    if (e.code !== 'credential-protected' && e.code !== 'EPERM' && e.code !== 'EACCES') throw e;
+    // Windows 无管理员权限/未开发者模式时创建 symlink 会 EPERM——此时跳过而非失败
+  }
+});
+
+test('0.5.1 写方向同样挡住变形路径（不能覆写凭据劫持链路）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const secretFile = join(dir, 'fake-token.txt');
+  writeFileSync(secretFile, 'SYNTHETIC-FAKE-original', 'utf8');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', TASK_BRIDGE_TOKEN_FILE: secretFile };
+  const { impl } = makeImpl(env);
+
+  for (const variant of [secretFile.replace('fake-token.txt', 'FAKE-TOKEN.TXT'), `${secretFile}::$DATA`]) {
+    try {
+      impl.writeFile({ path: variant, content: 'HIJACKED' });
+      assert.fail(`写方向必须拒绝变形路径：${variant}`);
+    } catch (e) {
+      assert.equal(e.code, 'credential-protected');
+    }
+  }
+  assert.equal(readFileSync(secretFile, 'utf8'), 'SYNTHETIC-FAKE-original', '原文件必须未被触碰');
+});
+
+test('0.5.1 buildExecEnv 剔除桥凭据、本插件配置与秘密模式键', () => {
+  const out = buildExecEnv({
+    PATH: '/usr/bin', SystemRoot: 'C:\\Windows', USERPROFILE: 'C:\\Users\\x',
+    TASK_BRIDGE_TOKEN: 'super-secret', TASK_BRIDGE_TOKEN_FILE: '/x/y',
+    DSH_BRIDGE_LOCAL_FS: '1', DSH_READBACK_DISABLED: '1',
+    MANA_API_KEY: 'k1', MOONTONTECH_API_KEY: 'k2',
+    AWS_SECRET_ACCESS_KEY: 'k3', GITHUB_TOKEN: 'k4', DB_PASSWORD: 'k5',
+    SOME_RANDOM_VAR: 'ok',
+  });
+
+  assert.equal(out.PATH, '/usr/bin', '命令必需的系统变量要保留');
+  assert.equal(out.SystemRoot, 'C:\\Windows');
+  assert.equal(out.SOME_RANDOM_VAR, undefined, '白名单外一律不放行');
+  for (const blocked of ['TASK_BRIDGE_TOKEN', 'TASK_BRIDGE_TOKEN_FILE', 'DSH_BRIDGE_LOCAL_FS',
+    'DSH_READBACK_DISABLED', 'MANA_API_KEY', 'MOONTONTECH_API_KEY', 'AWS_SECRET_ACCESS_KEY',
+    'GITHUB_TOKEN', 'DB_PASSWORD']) {
+    assert.equal(out[blocked], undefined, `${blocked} 绝不能传给子进程`);
+  }
+});
+
+test('0.5.1 exec 不把桥 token 交给子进程（0.5.0 一条命令即可读出）', async () => {
+  // 0.5.0 用 env: {...process.env} 全量继承，评审双方独立实测：
+  // local_exec{command:'node -e "console.log(process.env.TASK_BRIDGE_TOKEN)"'} 直接把 token 送进云端记录。
+  const { impl } = makeImpl({ DSH_BRIDGE_LOCAL_EXEC: '1' });
+  const script = writeScript('exec-envleak.mjs',
+    'process.stdout.write(JSON.stringify({t:process.env.TASK_BRIDGE_TOKEN??null,f:process.env.FAKE_INJECTED??null}));');
+
+  const r = await impl.exec({ command: `node "${script}"`, cwd: TMP, timeoutMs: 15000 });
+
+  const seen = JSON.parse(r.stdout || '{}');
+  assert.equal(seen.t, null, '子进程不得看到 TASK_BRIDGE_TOKEN');
+  assert.equal(seen.f, null, '白名单外的变量一律不可见');
+});
+
+test('0.5.1 treeKillFn 的 spawn 失败不得崩掉宿主（必须挂 error 监听）', async () => {
+  // 0.5.0：try/catch 只捕获同步抛出，而 spawn 失败是异步 'error' 事件 →
+  // EventEmitter 抛未捕获异常，整个 MCP server 崩溃，连带 7 个桥工具一起不可用
+  // （评审实测 exit=9 UNCAUGHT:spawn taskkill ENOENT）。
+  const fakeChild = {
+    stdout: { on() {}, destroy() {} }, stderr: { on() {}, destroy() {} },
+    // close 必须晚于 1ms 的超时定时器：setImmediate 会在 setTimeout(1) 之前触发，
+    // 那样 finish 先收口、treeKill 根本不会被调用，断言就变成假失败。
+    on: (ev, fn) => { if (ev === 'close') setTimeout(() => fn(null, 'SIGKILL'), 200); },
+    kill() {}, pid: 4242,
+  };
+  let errorListenerAttached = false;
+  const env = { DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_EXEC_TIMEOUT_MS: '1000' };
+  const impl = createLocalTools({
+    env, config: resolveLocalConfig(env), logger: { info() {}, warn() {} },
+    spawnFn: () => fakeChild,
+    treeKillFn: () => {
+      // 返回一个"会异步抛 error"的假子进程，模拟 taskkill ENOENT/EACCES
+      const handlers = {};
+      const tk = {
+        on: (ev, fn) => { handlers[ev] = fn; if (ev === 'error') errorListenerAttached = true; },
+        stdout: { resume() {} }, stderr: { resume() {} },
+      };
+      setImmediate(() => handlers.error?.(Object.assign(new Error('spawn taskkill ENOENT'), { code: 'ENOENT' })));
+      return tk;
+    },
+  });
+
+  const r = await impl.exec({ command: 'anything', timeoutMs: 1 });
+  assert.equal(errorListenerAttached, true, 'treeKill 必须给 taskkill 子进程挂 error 监听器，否则宿主崩溃');
+  assert.equal(r.timedOut, true, '即便杀树失败也要如实收口');
+});
+
+test('0.5.1 treeKill 不得在 taskkill 之后立刻同步 kill（否则 taskkill 查不到 PID）', async () => {
+  // 0.5.0 的顺序错误：同步 child.kill 先把 shell 杀掉，等异步的 taskkill 去查 PID 时
+  // 进程已不存在 → 实测 taskkill exit=128「没有找到进程」，孙进程活到自然结束，
+  // 而回执 note 却声称「已杀整棵进程树」。
+  const events = [];
+  const fakeChild = {
+    stdout: { on() {}, destroy() {} }, stderr: { on() {}, destroy() {} },
+    on: (ev, fn) => { if (ev === 'close') setTimeout(() => fn(null, 'SIGKILL'), 30); },
+    kill: () => events.push('child.kill'),
+    pid: 4242,
+  };
+  const env = { DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_EXEC_TIMEOUT_MS: '1000' };
+  const impl = createLocalTools({
+    env, config: resolveLocalConfig(env), logger: { info() {}, warn() {} },
+    spawnFn: () => fakeChild,
+    treeKillFn: () => {
+      events.push('taskkill-spawn');
+      const handlers = {};
+      const tk = { on: (ev, fn) => { handlers[ev] = fn; }, stdout: { resume() {} }, stderr: { resume() {} } };
+      setImmediate(() => { events.push('taskkill-close'); handlers.close?.(0, null); });
+      return tk;
+    },
+  });
+
+  await impl.exec({ command: 'anything', timeoutMs: 1 });
+  assert.ok(events.indexOf('taskkill-spawn') < events.indexOf('child.kill'),
+    `必须先 taskkill 再兜底 kill，实际顺序：${events.join(' → ')}`);
+  assert.ok(events.includes('taskkill-close'), 'child.kill 应由 taskkill 的 close 回调触发');
+});
+
+test('0.5.1 exec 输出按字节计上限（CJK 不得突破 maxBytes 3 倍）', async () => {
+  // 0.5.0 用 stdout.length（UTF-16 码元）比较与裁剪，实测 10 万汉字 = 100005 码元 /
+  // 300015 字节，而声明上限 262144 —— 多字节内容下上限被突破约 3 倍。
+  const env = { DSH_BRIDGE_LOCAL_EXEC: '1', DSH_BRIDGE_FS_MAX_BYTES: '3000' };
+  const impl = createLocalTools({ env, config: resolveLocalConfig(env), logger: { info() {}, warn() {} } });
+  const script = writeScript('exec-cjk.mjs', 'process.stdout.write("中".repeat(5000));');
+
+  const r = await impl.exec({ command: `node "${script}"`, cwd: TMP, timeoutMs: 20000 });
+
+  const outBytes = Buffer.byteLength(r.stdout, 'utf8');
+  assert.ok(outBytes <= 3000, `stdout 字节数必须 ≤ maxBytes，实际 ${outBytes}`);
+  assert.equal(r.outputTruncated, true);
+  assert.ok(Number.isInteger(r.stdoutBytes), '回执要给出真实字节数');
+});
+
+test('0.5.1 grep 单文件模式必须受 maxBytes 与二进制闸门约束', (t) => {
+  // 0.5.0 的单文件分支没有 size 也没有 NUL 检查：实测 maxBytes=1024 时仍把 200MB 文件
+  // 整体读入堆（rss +392MB），含 NUL 的文件也照搜并把乱码灌进上下文。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const big = join(dir, 'big.txt');
+  writeFileSync(big, 'x'.repeat(200_000), 'utf8');
+  const bin = join(dir, 'blob.bin');
+  writeFileSync(bin, Buffer.from([0x68, 0x00, 0x69, 0x74, 0x2d, 0x62, 0x69, 0x6e]));
+
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_MAX_BYTES: '1024' };
+  const { impl } = makeImpl(env);
+
+  const bigR = impl.grep({ pattern: 'x', path: big });
+  assert.equal(bigR.matchCount, 0, '超限文件不得被搜索');
+  assert.equal(bigR.skipped.oversize, 1, '必须如实计入超限跳过');
+
+  const binR = impl.grep({ pattern: 'hit', path: bin });
+  assert.equal(binR.matchCount, 0, '二进制文件不得被搜索');
+  assert.equal(binR.skipped.binary, 1);
+});
+
+test('0.5.1 grep 深度到顶必须报告 depthLimited（不得静默截断）', (t) => {
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  // 造一条深于上限的链：depth 上限设 2，实际造 4 层
+  let cur = dir;
+  for (let i = 0; i < 4; i += 1) { cur = join(cur, `d${i}`); mkdirSync(cur, { recursive: true }); }
+  writeFileSync(join(cur, 'deep.txt'), 'hit-deep', 'utf8');
+  writeFileSync(join(dir, 'top.txt'), 'hit-top', 'utf8');
+
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_GREP_MAX_DEPTH: '2' };
+  const { impl } = makeImpl(env);
+  const r = impl.grep({ pattern: 'hit', path: dir });
+
+  assert.equal(r.depthLimited, true, '深度到顶必须置标志：0.5.0 静默停止下潜，truncated:false 被读成「搜全了」');
+  assert.ok(r.matches.some((m) => m.path.endsWith('top.txt')), '浅层命中仍要在');
+  assert.ok(!r.matches.some((m) => m.path.endsWith('deep.txt')), '深层命中确实没搜到——所以才必须报告');
+});
+
+test('0.5.1 readFile 读回后复检字节数（TOCTOU / 增长中的日志）', (t) => {
+  // 0.5.0 只校验 stat.size，读回的 buf 从不再比对上限：用 fs 注入 seam 可确定性证明
+  // stat 报 100 字节而实际返回 500 万字符。真实场景是读一个正被追加的日志。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const f = join(dir, 'lying.txt');
+  writeFileSync(f, 'short', 'utf8');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_MAX_BYTES: '1024' };
+  const impl = createLocalTools({
+    env, config: resolveLocalConfig(env), logger: { info() {}, warn() {} },
+    fs: {
+      statSync: (p, o) => ({ isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false, size: 100, mtime: new Date() }),
+      readFileSync: () => Buffer.from('x'.repeat(5_000_000)),
+      writeFileSync, appendFileSync, readdirSync, mkdirSync, chmodSync: () => {},
+    },
+  });
+
+  try {
+    impl.readFile({ path: f });
+    assert.fail('读回后必须复检字节数');
+  } catch (e) {
+    assert.equal(e.code, 'too-large');
+    assert.match(e.message, /实际读取字节数/);
+  }
+});
+
+test('0.5.1 审计可落盘（DSH_BRIDGE_AUDIT_FILE）——stderr 在生产部署下不进 tunnel-client 日志', (t) => {
+  // 安全评审实测：3.9MB debug 日志、两次 tunnel-client 启动，对 bridge-mcp 的 stderr 零命中
+  // （profile 的 mcp.commands[] 没有 stderr 重定向字段）。所以「写与执行都留审计」这条
+  // 无人在环风险的唯一补偿性控制，在主要部署形态下根本不落盘。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const auditFile = join(dir, 'audit.log');
+  const target = join(dir, 'written.txt');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_AUDIT_FILE: auditFile };
+  const impl = createLocalTools({ env, config: resolveLocalConfig(env) }); // 不注入 logger，用默认（含落盘）
+
+  impl.writeFile({ path: target, content: 'audit-me' });
+
+  assert.ok(existsSync(auditFile), '审计文件必须被创建');
+  const lines = readFileSync(auditFile, 'utf8').trim().split('\n');
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^AUDIT local_write_file path=/);
+  assert.ok(!lines[0].includes('audit-me'), '落盘审计同样不得含文件内容');
+});
+
+test('0.5.1 writeFile 在 stat 失败时仍留审计行（写已落盘不得无痕）', (t) => {
+  // 0.5.0 把 statSync 放在审计行之前且不在 try 内：写已落盘但 stat 抛错时
+  // 审计 0 条、回执退化成 internal-error —— 文件被改了却无痕。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  const f = join(dir, 'w.txt');
+  const infos = [];
+  let statCalls = 0;
+  const env = { DSH_BRIDGE_LOCAL_FS: '1' };
+  const impl = createLocalTools({
+    env, config: resolveLocalConfig(env), logger: { info: (m) => infos.push(m), warn() {} },
+    fs: {
+      statSync: (p, o) => { statCalls += 1; if (statCalls > 1) { const e = new Error('EACCES'); e.code = 'EACCES'; throw e; } return statSync(p, o); },
+      readFileSync, writeFileSync, appendFileSync, readdirSync, mkdirSync, chmodSync: () => {},
+    },
+  });
+
+  const r = impl.writeFile({ path: f, content: 'written-anyway' });
+
+  assert.equal(infos.length, 1, '审计行必须在 stat 之前发出');
+  assert.match(infos[0], /writtenBytes=14/);
+  assert.equal(r.ok, true);
+  assert.equal(r.statUnavailable, true, '必须如实标注 stat 不可用，而非谎报大小');
+  assert.equal(readFileSync(f, 'utf8'), 'written-anyway', '写确实发生了');
+});
+
+test('0.5.1 limit 入参必须 clamp（回执体积不得由调用方决定）', (t) => {
+  // 0.5.0 的 limit 无上限：实测 limit=1e8 时 grep 单文件模式回执 JSON 达 6.70MB，
+  // listDir 递归 4008 条 / 476KB，与 maxBytes 完全脱钩。
+  const dir = makeTempDir();
+  t.after(() => cleanup(dir));
+  for (let i = 0; i < 30; i += 1) writeFileSync(join(dir, `f${i}.txt`), 'hit', 'utf8');
+  const { impl } = makeImpl();
+
+  const listed = impl.listDir({ path: dir, limit: 1e8 });
+  assert.ok(listed.count <= 5000, `listDir 条目必须 clamp，实际 ${listed.count}`);
+
+  const grepped = impl.grep({ pattern: 'hit', path: dir, limit: 1e8 });
+  assert.ok(grepped.matchCount <= 5000, `grep 命中必须 clamp，实际 ${grepped.matchCount}`);
+});
+
+test('0.5.1 五个工具都必须带 annotations（MCP 客户端据此加机械闸门）', () => {
+  const tools = buildLocalTools({ env: { DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_LOCAL_EXEC: '1' } });
+  assert.equal(tools.length, 5);
+  const expect = {
+    local_read_file: { readOnlyHint: true, destructiveHint: false },
+    local_write_file: { readOnlyHint: false, destructiveHint: true },
+    local_list_dir: { readOnlyHint: true, destructiveHint: false },
+    local_grep: { readOnlyHint: true, destructiveHint: false },
+    local_exec: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+  };
+  for (const t of tools) {
+    assert.ok(t.annotations, `${t.name} 缺 annotations —— 只写在 description 里是纪律不是防线`);
+    for (const [k, v] of Object.entries(expect[t.name])) {
+      assert.equal(t.annotations[k], v, `${t.name}.annotations.${k}`);
+    }
+  }
+});
+
+test('0.5.1 buildLocalTools 必须真正采用注入的 config（0.5.0 是死参数）', () => {
+  const cfg = resolveLocalConfig({ DSH_BRIDGE_LOCAL_FS: '1', DSH_BRIDGE_FS_MAX_BYTES: '777' });
+  const tools = buildLocalTools({ env: {}, config: cfg }); // env 故意不含开关
+  assert.equal(tools.length, 4, '注入的 config 必须生效，而不是被重新解析的空 env 覆盖');
+});
+
+test('0.5.1 guardPath 对 op=exec 的拒绝文案不得说「写入」', () => {
+  const dir = join(homedir(), '.ssh');
+  try {
+    guardPath(dir, { op: 'exec' });
+    assert.fail('受保护目录作 cwd 应被拒');
+  } catch (e) {
+    assert.equal(e.code, 'credential-protected');
+    assert.match(e.message, /以该路径为工作目录/, '文案要与实际操作相符');
+    assert.ok(!e.message.includes('拒绝写入'), '0.5.0 在 exec 场景下误说「拒绝写入」');
+  }
+});
+

@@ -18,22 +18,40 @@ const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url),
 const SERVER_INFO = { name: pkg.name, version: pkg.version };
 
 /**
- * 本地文件/命令工具（0.5.0）：默认关闭。env DSH_BRIDGE_LOCAL_FS=1 开文件四件套、
- * DSH_BRIDGE_LOCAL_EXEC=1 另开 local_exec——两个独立开关，只开文件不开 shell 是常见
- * 且更稳的形态。都不设时 LOCAL_TOOLS 为空数组，既有 7 工具链路**逐字节零变化**。
+ * 本地文件/命令工具（0.5.0 引入，0.5.1 加固）：默认关闭。env DSH_BRIDGE_LOCAL_FS=1 开文件
+ * 四件套、DSH_BRIDGE_LOCAL_EXEC=1 另开 local_exec——两个独立开关。都不设时 LOCAL_TOOLS 为空
+ * 数组，tools/list、instructions、错误信封与桥路径**逐字节零变化**（initialize 仅
+ * serverInfo.version 随版本轨道变化）。
  *
  * 进程启动时读一次 env（不支持热切换：改开关必须重启 bridge-mcp / tunnel-client）。
  * 这是有意的——能力面在进程生命周期内固定，避免"跑着跑着多出个 shell 工具"。
+ *
+ * 整段包 try/catch（0.5.1）：模块加载期抛错会让整个 server 起不来，**连既有 7 个桥工具
+ * 一起死**——那是可选能力拖垮核心链路。失败时降级为「不注册本地工具 + stderr 强告警」。
  */
-const LOCAL_CONFIG = resolveLocalConfig();
-const LOCAL_TOOLS = buildLocalTools({ config: LOCAL_CONFIG });
+let LOCAL_CONFIG;
+let LOCAL_TOOLS;
+try {
+  LOCAL_CONFIG = resolveLocalConfig();
+  LOCAL_TOOLS = buildLocalTools({ config: LOCAL_CONFIG });
+} catch (error) {
+  LOCAL_CONFIG = resolveLocalConfig({}); // 全默认（两个开关均 false），保证下面的引用不落空
+  LOCAL_TOOLS = [];
+  process.stderr.write(
+    `[bridge-mcp] WARN 本地工具初始化失败，已降级为不注册（7 个桥工具不受影响）：${error?.message ?? error}\n`,
+  );
+}
 /** 全部工具：桥侧 7 个（冻结契约）+ 本地若干（门控）。分发与 tools/list 共用同一数组。 */
 const ALL_TOOLS = [...TOOLS, ...LOCAL_TOOLS];
 /** instructions 同样按启用集合动态拼接，未启用就不提本地工具（不诱导模型去调不存在的工具）。 */
 const ALL_INSTRUCTIONS = [INSTRUCTIONS, ...buildLocalInstructions(LOCAL_CONFIG)].join('\n');
 
 if (LOCAL_TOOLS.length > 0) {
-  // 运维可见性：这个进程开了什么能力必须能在 tunnel-client 日志里一眼看到。
+  // 运维可见性：这个进程开了什么能力必须能在日志里一眼看到。
+  // ⚠️ 但**不要指望它落进 tunnel-client 的日志文件**——安全评审实测 3.9MB debug 日志、
+  // 两次启动、对 bridge-mcp 的 stderr 零命中（profile 的 mcp.commands[] 没有 stderr 重定向
+  // 字段）。经 tunnel-client 部署时 stderr 的实际去向未取证。要持久审计请用
+  // DSH_BRIDGE_AUDIT_FILE（见 README）。
   process.stderr.write(
     `[bridge-mcp] local tools ENABLED: ${LOCAL_TOOLS.map((t) => t.name).join(', ')} `
     + `(maxBytes=${LOCAL_CONFIG.maxBytes}, execTimeoutMs=${LOCAL_CONFIG.execTimeoutMs}, `

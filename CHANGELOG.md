@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.5.1] - 2026-09-24
+
+### 安全修复：0.5.0 的凭据保护可被两条独立路径完全绕过
+
+四路并行评审（安全攻击 / 正确性含变异测试 / 文档一致性 / 契约兼容）后，安全与正确性两路各自独立判定 **不通过**。所有 P0/P1 均由评审给出 PoC、并由维护者用独立脚本复现确认后修复。
+
+**P0-A 递归遍历完全绕过三层路径保护**（正确性评审发现，安全评审未覆盖此路径）：`guardPath` 只作用于搜索/列举的**根**，`walk` 内对发现的每个文件从不检查。于是**一次** `local_grep(path=父目录)` 就能读出 `~/.dsh/task-bridge-token`、`.credentials.yaml`、`.env`、`*.pem` 的**原文**——正是模块头注释自己定义的最坏情况。更糟的是 README 推荐的「只开 `LOCAL_FS` 不开 shell」这个"更安全"配置恰恰是绕过生效的配置，且 51 个用例里**零覆盖**（所有凭据保护断言都只走 readFile/writeFile）。
+修复：新增 `guardWalkEntry`（不抛错、返回 null 即跳过），`grep` 与 `listDir` 的 walk 对**每个文件与每个待递归目录**都过一遍三级保护；跳过数如实计入 `skipped.protected` 并置 `truncated`。`PROTECTED_DIRS` 补 `.dsh`（整棵树），使「把 `~/.dsh` 当搜索根」在根上就被拒。
+
+**P0-B 路径变形击穿强制保护，读写双向**（安全评审发现）：`guardPath` 用 `resolve()`（纯字符串规范化）+ 精确字符串比较，四条独立通道全部绕过——大小写变形（`TASK-BRIDGE-TOKEN`、`c:\users\…`）、NTFS 备用数据流（`token::$DATA`）、UNC 前缀（`\\?\`、`\\.\`）、symlink/junction。写方向同样穿透，意味着可把桥 token 覆写成攻击者已知值、直接劫持整条链路鉴权。
+修复：新增 `canonical()`（剥 `::` 流名 → `realpathSync.native` 解析真实路径 → 在不区分大小写的平台 lowercase），三级保护**两侧**都用 canonical 比较；强制保护补「候选落在保护项子树内」匹配。另加 `displayPath()` 专供回执——canonical 的小写形式不能直接返回给用户（初版犯过这个错，回执与审计行里路径全变小写），displayPath 保留 OS 正确大小写，且对尚不存在的路径逐级上溯到最近的存在祖先再拼回。
+
+**P0-C `local_exec` 全量继承 `process.env`**（安全与正确性评审各自独立实测）：`env: { ...process.env }` 使一条 `local_exec{command:'node -e "console.log(process.env.TASK_BRIDGE_TOKEN)"'}` 就把桥 token 送进云端对话记录——而 `TASK_BRIDGE_TOKEN` 是 README 明确支持、优先级最高的注入方式；本机还实测存在 `MANA_API_KEY`、`MOONTONTECH_API_KEY` 等用户级秘密。这不是 exec 的固有风险而是纯代码选择。
+修复：改为 `buildExecEnv()` 白名单（PATH/SystemRoot/ComSpec/PATHEXT/TEMP/USERPROFILE/APPDATA 等命令必需项）+ 双重强制剔除（`TASK_BRIDGE_*`/`DSH_BRIDGE_*`/`DSH_READBACK_*` 前缀，以及名字命中 `API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH|PRIVATE_KEY|ACCESS_KEY` 模式的键）。
+
+**P1-A `treeKill` 的 spawn 未挂 error 监听 → 整个 MCP server 崩溃**：`try/catch` 只能捕获同步抛出，而 spawn 失败是异步 `'error'` 事件 → EventEmitter 未捕获异常。实测 taskkill 不在 PATH 时 `exit=9 UNCAUGHT:spawn taskkill ENOENT`，**连带 7 个桥工具一起不可用**——直接推翻 0.5.0 commit message 的「cannot affect existing consumers」。修复：挂 `error` 监听 + `resume()` 掉 stdio；POSIX 侧改用 `process.kill(-pid)` 消除对外部 `/bin/kill` 的依赖。
+
+**P1-B 树杀实际失效，回执却声称已杀树**：`treeKill` 先异步 spawn taskkill、紧接着**同步** `child.kill('SIGKILL')` 把 shell 杀掉，等 taskkill 去查 PID 时进程已不存在——实测 `taskkill exit=128「没有找到进程」`，孙进程活到 5800ms（脚本寿命 6000ms，超时设 600ms），而 note 写着「已杀整棵进程树」。后果是破坏性命令超时后**继续跑**，且每次超时泄漏一个孤儿进程（评审在测试跑完 8s 后仍在进程表里抓到 PID 1224）。修复：改为 taskkill 的 `close` 回调里再兜底 kill（外加 2s 上界），并给 POSIX 分支加 `detached: true` 使 `child.pid` 真的成为 PGID。实测孙进程存活从 5800ms 降到 600ms。
+
+**P1-C grep 单文件模式无 size / 二进制闸门**：该分支直接 `readFileSync(root)`，实测 `maxBytes=1024` 时仍把 200MB 文件整体读入堆（rss +392MB），含 NUL 的文件也照搜并把乱码灌进上下文；且 `filesScanned` 恒为 0、limit 触顶不置 `truncated`。修复：与目录模式共用 `scanFile`（同一套 stat/NUL/保护检查）。
+
+**P1-D ReDoS 可冻结整个 server 且不可取消**（安全评审实测 `(a+)+b` 指数增长、事件循环 5ms 心跳归零）：`notifications/cancelled` 的 abort signal 只传给桥 fetch，本地工具 handler 忽略 `_client`，取消对其是 no-op。**本版未修**（需要 worker_threads 重构），已在 README 风险节如实披露并给出规避建议。
+
+### 有界性与回执诚实度
+
+- `DSH_BRIDGE_FS_MAX_BYTES` 改**字节**语义：0.5.0 用 `String.length`（UTF-16 码元）比较与裁剪，CJK 内容下实测突破上限约 3 倍（10 万汉字 = 100005 码元 / 300015 字节，上限 262144）。现按 `Buffer.byteLength` 计数、`sliceBytes` 按字节裁剪并回退到 UTF-8 字符边界；回执新增 `stdoutBytes`/`stderrBytes`。
+- 输出超限后**停止累积**：0.5.0 只阻止再次 treeKill 却继续 `stdout += text`，峰值内存由「子进程被杀前能灌多快」决定（实测 300MB 洪水使 rss 90MB → 885MB）。
+- `StringDecoder` 处理多字节字符跨 chunk 边界：0.5.0 直接 `chunk.toString('utf8')`，大输出必现乱码（实测 400KB 中文 10 个 U+FFFD、900KB 20 个）。
+- `limit` 入参 clamp（listDir ≤5000、grep ≤5000）：0.5.0 无上限，实测 `limit=1e8` 时 grep 单文件回执 JSON 达 6.70MB、listDir 4008 条 / 476KB，与 maxBytes 完全脱钩。
+- `readFile` 读回后**复检**字节数：0.5.0 只校验 `stat.size`，读一个正被追加的日志就能拿到超限内容（用 fs 注入 seam 实测 stat 报 100 而返回 5000002 字符）。
+- grep 深度到顶置 `depthLimited`（0.5.0 静默停止下潜，`truncated:false` 被读成「搜全了」）；跳过文件逐项计数 `skipped.{oversize,binary,protected,unreadable}`，有跳过即置 `truncated` 并给 `note`。
+- `writeFile` 审计行**前置于 statSync**：0.5.0 在「写已落盘但 stat 抛错」时审计 0 条、回执退化成 internal-error——文件被改了却无痕，违反「每次写都留审计」。现记 `writtenBytes`（无需 stat），stat 失败时如实返回 `statUnavailable: true` 而非谎报大小。
+- `writeFile` 的 pre-write stat 抛非 ENOENT 错误时不再一律报 `existed=false`（0.5.0 会在 EACCES 下谎报「新建」并 previousSize=0，随后覆写真实文件）。
+- 五个工具全部补 `annotations`（`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`）：只写在 description 里是纪律不是防线，annotations 才是 MCP 客户端能据此加机械闸门的通道。
+- `server.mjs` 模块级构造包 try/catch：本地工具初始化失败时降级为不注册 + stderr 强告警，**保住 7 个桥工具**（可选能力不该拖垮核心链路）。
+- `buildLocalTools` 真正采用注入的 `config`（0.5.0 忽略 `deps.config` 自行重算，server 传的 `LOCAL_CONFIG` 是死参数）。
+- `guardPath` 对 `op='exec'` 的拒绝文案不再说「拒绝写入」（0.5.0 三元只区分 read 与非 read）。
+- 新增 `DSH_BRIDGE_AUDIT_FILE`：审计行落盘。安全评审实测生产 `tunnel-client.log`（3.9MB debug、两次启动）对 bridge-mcp 的 stderr **零命中**（profile 无 stderr 重定向字段），于是「写与执行都留审计」这条无人在环风险的唯一补偿性控制在主要部署形态下根本不落盘。
+
+### 文档修正（评审 C 逐条核对 120+ 条事实性陈述后指出）
+
+- **「模式 A 有人在环（DSH 确认闸门）」与实现相反**（P0，出现在 5 处）：桥 `/v1/spawn` 直调 `ops.spawnTask`，其签名无 `confirmationId`，确认门只在 `spawnBatch`；`bridge-policy.mjs` 的注释本身即写明「MVP 桥只用单发 spawnTask（无 coordinator 侧确认门——门只在 spawnBatch）」。已改为「任务在 DSH 侧可见、可 steer/cancel，但派发不经确认卡，只有 60s/10 次策略闸」。这是本轮两份文档做风险对比的核心论据，原文把风险说小了。
+- **「凭据强制不可读写且不可配置解除」补 exec 例外**：该保护只约束文件工具的路径参数，开了 `LOCAL_EXEC` 后一条命令即可读出，第 ②③ 层对 exec 不成立。
+- **「只开文件、不开 shell 是更稳的形态」不成立**：文件写权限本身足以达成代码执行与持久化（写 `src/server.mjs`——生产 profile 直接跑工作树、下次启动即执行；写 Windows 启动项、PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理）。改为「更窄而非安全」。
+- **补「怎么设这些开关」节**：0.5.0 的头号特性在 tunnel-client 形态下**没有任何文档化的启用路径**——profile 无 env 字段、`command` 串不经 shell（`set X=1 && node …` 会被当成可执行文件名而失败），而 9 个 `DSH_BRIDGE_*` 变量唯一被讲解的位置是 Codex `config.toml` 子节。现按三种部署形态分别给出可复制命令与生效证据。
+- 审计「会落进 tunnel-client 日志」的声称按实测更正，并指向 `DSH_BRIDGE_AUDIT_FILE`。
+- `local_grep`「不静默截断」按新语义重写（深度到顶置 `depthLimited`、跳过逐项计数）。
+- 「逐字节零变化」改为准确表述：`tools/list`、`instructions`、错误信封与桥路径逐字节相同，`initialize` 仅 `serverInfo.version` 随版本轨道变化（契约评审用 0.4.1 与 0.5.0 双进程逐字节比对取证）。
+- `client.mjs` 的 token 缺失错误文案不再指向已 DEPRECATED 的 `dsh-plugin-task-bridge`（它与 README「不要再去装它」直接冲突，会把用户推去装废弃包），改为指向 coordinator ≥0.27.2 自动生成或手工创建。
+- CHANGELOG 0.5.0 的「48 例」更正为 51（与同句「原 51 + 新 51」自相矛盾）；README「10 个用例全绿」更正为 122 并给出分布。
+
+### 验证
+
+- 离线单测 **122/122** 全绿（0.5.0 的 102 + 新增 20 条 0.5.1 回归钉子，逐条对应上述缺陷：递归 guard、canonical 四类变形、写方向变形、`.dsh` 作根被拒、`buildExecEnv` 剔除、exec 不见 token、treeKill error 监听、taskkill 与 child.kill 的**先后顺序**、字节上限、单文件闸门、`depthLimited`、读回复检、审计落盘、stat 失败仍留审计、limit clamp、annotations、注入 config 生效、exec 文案）。
+- 维护者独立复现脚本回归：安全 PoC 从「10 项指控成立」→ **0 项**；正确性 PoC 从「6 项核心指控」→ **0 项**（grep 不再泄、树杀 600ms 生效、server 不再崩溃）。
+- 0.5.0 的既有修复经变异测试复核仍然成立（撤掉 `destroy()` → `duration_ms` 30300ms；三个防回归钉子撤掉修复后均失败）。
+- **未修且已披露**：ReDoS（需 worker_threads 重构）、默认凭据保护清单仍漏 `~/.codex/auth.json`、`~/.config/gh/hosts.yml`、`.bash_history`、`~/.git-credentials`、`~/.docker/config.json` 等（安全评审逐个实测本机存在且可读）——建议用 `DSH_BRIDGE_FS_DENY` 自行收窄，或等后续版本的 `DSH_BRIDGE_FS_ALLOW` 白名单模式。
+
 ## [0.5.0] - 2026-09-24
 
 ### 新增：本地文件与命令工具（`local_*`，默认关闭）

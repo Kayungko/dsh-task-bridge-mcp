@@ -140,6 +140,13 @@ tool_timeout_sec = 60          # wrapper 的 wait 工具已按 50s 上限钳制�
 | `DSH_BRIDGE_LOCAL_CWD` | 本地工具的缺省工作目录 | bridge-mcp 进程 cwd |
 | `DSH_BRIDGE_FS_DENY` | 追加路径黑名单（`path.delimiter` 分隔，按目录前缀匹配） | 不设置 |
 | `DSH_BRIDGE_FS_DENY_CREDENTIALS` | `=0` 解除默认凭据保护（启动打强告警） | 保护开启 |
+| `DSH_BRIDGE_AUDIT_FILE` | 审计行落盘路径（append-only，一行一条） | 不落盘，仅 stderr |
+
+> ⚠️ **别指望 stderr 能当审计留痕**：安全评审实测生产 `tunnel-client.log`（3.9MB debug 级、
+> 覆盖两次启动）对 bridge-mcp 的 stderr **零命中**——profile 的 `mcp.commands[]` 只有
+> `channel` 与 `command` 两个字段，没有 stderr 重定向口子。要事后追溯网页侧动过什么，
+> 必须显式设 `DSH_BRIDGE_AUDIT_FILE`（建议放仓库外，如 `%USERPROFILE%\.dsh\bridge-audit.log`）。
+> 落盘内容同样只含路径与命令原文，不含文件内容与命令输出。
 
 token 解析顺序：`TASK_BRIDGE_TOKEN` > `TASK_BRIDGE_TOKEN_FILE` > 默认文件路径；
 每次请求前惰性重读（桥重启轮换 token 后无需重启 wrapper）。
@@ -206,11 +213,16 @@ shell 工具"。启用时 stderr 会打一条横幅，便于在 tunnel-client �
 | 额度 | 消耗 DSH 侧模型额度 | **零模型额度** |
 | 延迟 | 秒级到分钟级（要等 agent 跑） | 毫秒级 |
 | 拿到的 | agent 的转述 + 尾部摘要（默认 6 条消息） | 文件原文 / 命令原始输出 |
-| 人在环 | 有（DSH 确认闸门、用户在场） | **没有** |
+| 人在环 | **部分**：任务在 DSH 侧栏实时可见、可随时 steer/cancel；但桥侧单发 spawn **不弹确认卡**（确认门只覆盖 `task_spawn_batch`，见 `bridge-policy.mjs` 的设计说明），只有 60s/10 次策略闸 | **没有** |
 | 适合 | 需要推理、改多处、跑测试的开发任务 | 查代码、读配置、看日志、跑一条命令 |
 
 **默认一个都不注册**：不设 `DSH_BRIDGE_LOCAL_FS` / `DSH_BRIDGE_LOCAL_EXEC` 时 `tools/list`
-仍是原来 7 个，既有链路逐字节零变化。两者是独立开关，「只开文件、不开 shell」是常见且更稳
+仍是原来 7 个，既有链路零变化（`tools/list`、`instructions`、错误信封与桥路径逐字节相同；
+`initialize` 仅 `serverInfo.version` 随版本轨道变化）。两者是独立开关，「只开文件、不开 shell」
+能挡掉命令执行，但**不构成质变意义上的"安全档"**：文件写权限本身就足以达成代码执行与持久化
+（写 `src/server.mjs` —— 生产 profile 直接跑工作树，下次启动即执行；写 Windows 启动项、
+PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理）。所以只开 FS 是
+「更窄」而非「安全」，别把它当成可以放心不管的档位。
 的形态。
 
 | 工具 | 开关 | 参数 | 说明 |
@@ -227,14 +239,19 @@ shell 工具"。启用时 stderr 会打一条横幅，便于在 tunnel-client �
 
 `local_*` 把**本机文件系统与 shell 暴露给一个云端模型会话**，且网页侧没有人在环的确认闸门。
 提示注入（模型读到的任何外部内容都可能是载体——网页内容、文件内容、命令输出）可直接指挥它
-读写文件、执行命令。与 `dsh_task_*` 的最坏情况（"派了个任务"，有 DSH 确认闸门兜底）不同，
+读写文件、执行命令。与 `dsh_task_*` 的最坏情况（"派了个任务"——任务在 DSH 里可见、可 steer 可 cancel，但**派发本身不经确认卡**，只有 60s/10 次策略闸）不同，
 这里的最坏情况是"仓库被改、命令被执行、文件被读走"。
 
 因此实现内置了四层防护，**不是可选项**：
 
 1. **默认关闭 + 两个独立开关**：不显式 opt-in 就一个工具都不注册。
 2. **本链路凭据强制不可读写**：`~/.dsh/task-bridge-token`（或 `TASK_BRIDGE_TOKEN_FILE`
-   指向的路径）与 `~/.dsh/.credentials.yaml` 一律拒绝，**且不可通过任何配置解除**。
+   指向的路径）与 `~/.dsh/.credentials.yaml` 一律拒绝，**且不可通过任何配置解除**——
+   这条只约束 `local_*` **文件工具的路径参数**（含递归遍历中遇到的每个条目，0.5.1 起）。
+   ⚠️ 一旦开了 `DSH_BRIDGE_LOCAL_EXEC=1`，同一条命令（`type` / `Get-Content` / `node -e` /
+   `certutil -encode`）就能直接读出这些文件，第 ②③ 层保护对 exec **不成立**。这不是实现缺陷
+   而是 shell 的固有性质：给了 shell 就没有文件级边界可言。所以「开 exec」的代价要按
+   「交出本机全部读权限」来估，不要按「文件工具那套保护还在」来估。
    理由：读走它们等于凭据永久留在云端对话记录里，属自毁而非能力。拒绝时不回吐任何文件内容。
 3. **默认凭据保护**（可用 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0` 显式解除，解除时启动打强告警）：
    `~/.ssh`、`~/.aws`、`~/.azure`、`~/.gnupg`、`~/.kube` 整棵树，以及 `.env`/`.env.*`、
@@ -244,6 +261,29 @@ shell 工具"。启用时 stderr 会打一条横幅，便于在 tunnel-client �
    `AUDIT local_write_file path=… mode=… existed=… previousSize=… newSize=…`、
    `AUDIT local_exec cwd=… timeoutMs=… exit=… timedOut=… command=…`。
    记路径与命令原文（都不是秘密），**绝不记文件内容与命令输出**（可能含敏感数据）。
+
+### 怎么设这些开关（三种部署形态各不相同，别照抄）
+
+`mcp.commands[]` 只接受 `channel` 与 `command` 两个字段（实测探测 `env`/`environment`/`cwd`/`argv` 全被严格字段校验拒绝），而 `command` 串又**不经 shell**——所以 `set X=1 && node …` 这种写法不行，`&&` 不会被解释，整串会被当成可执行文件名而报 script not found。
+
+- **Codex**：`~/.codex/config.toml` 的 `[mcp_servers.dsh-task-bridge]` 里加
+  `env = { DSH_BRIDGE_LOCAL_FS = "1" }`，重启 Codex。
+- **tunnel-client（ChatGPT 网页形态）**：profile 里没有 env 口子，唯一可行路径是设 **OS 用户级
+  环境变量**再重启 tunnel-client（子进程继承它的环境）：
+
+  ```powershell
+  [Environment]::SetEnvironmentVariable('DSH_BRIDGE_LOCAL_FS','1','User')
+  [Environment]::SetEnvironmentVariable('DSH_BRIDGE_AUDIT_FILE',"$env:USERPROFILE\.dsh\bridge-audit.log",'User')
+  # 停掉现有 tunnel-client 进程，再从**新开的**终端拉起（旧终端读不到新设的用户级变量）
+  Stop-Process -Name tunnel-client
+  Start-Process 'E:\Program Files\tunnel-client\tunnel-client.exe' -ArgumentList 'run','--config','<profile 路径>'
+  ```
+
+  生效证据：tunnel-client 日志（或该进程 stderr）里出现 `[bridge-mcp] local tools ENABLED: …`
+  横幅。**但审计行不会进 tunnel-client 的日志文件**（见上方 `DSH_BRIDGE_AUDIT_FILE` 的警告），
+  所以务必同时设审计落盘路径，否则事后无从追溯。
+  生效后要在 ChatGPT **新开对话**——云端只在握手时拉工具清单。
+- **手工 node**：`$env:DSH_BRIDGE_LOCAL_FS='1'; node src/server.mjs`（仅当前终端会话）。
 
 启用建议：
 
@@ -266,7 +306,16 @@ shell 工具"。启用时 stderr 会打一条横幅，便于在 tunnel-client �
   这就是句柄泄漏。
 - 另监听 `exit` 作为兜底（250ms 缓冲让已收数据落地）：宁可少几个尾字节，也不能让工具调用永久
   挂起（那会撞穿 MCP `tool_timeout_sec`，表现成"整个会话卡死"）。
-- `local_grep` 有文件数与深度上限，超限置 `truncated` 如实报告，不静默截断。
+- `local_grep` 的**文件数上限**（`DSH_BRIDGE_GREP_MAX_FILES`）与**命中数上限**（`limit`，clamp 到 5000）超限会置 `truncated` / `limitTruncated`；**深度上限**（`DSH_BRIDGE_GREP_MAX_DEPTH`，默认 12）到顶置 `depthLimited`（0.5.0 是静默停止下潜，`truncated:false` 会被读成「整棵树搜全了」）。
+- 被跳过的文件逐项计数并如实上报：`skipped.{oversize,binary,protected,unreadable}`，且**只要有跳过就置 `truncated=true`** 并给出 `note`——0.5.0 把超限/二进制文件静默 `continue` 却仍计入 `filesScanned`，于是「扫了 N 个、只有 1 处命中、没截断」无法区分"确实没有"与"被跳过了"。`local_list_dir` 同理报 `skippedProtected` / `depthLimited`。
+- 单文件模式（`path` 指向文件）与目录模式共用同一套 size / 二进制闸门（0.5.0 的单文件分支两者都没有：实测 `maxBytes=1024` 时仍把 200MB 文件整体读入堆，rss +392MB）。
+
+### 已知未修（0.5.1 如实披露，别按"已加固"来估风险）
+
+- **`local_grep` 的 pattern 是同步正则，恶意或失误的 pattern 可冻结整个 server**。安全评审实测 `(a+)+b` 对 28 个 `a` 呈指数增长（n=18→12ms、n=26→446ms、n=28→1760ms），期间 5ms 心跳 tick 归零即事件循环完全冻结；而 `notifications/cancelled` 的 abort signal 只传给桥的 fetch，本地工具 handler 忽略 `_client`，**取消对它是 no-op**。后果是 7 个 `dsh_task_*` 工具的响应、心跳与 `dsh_task_wait` 一起停摆，撞穿 MCP `tool_timeout_sec`，表现成「整个会话卡死」。触发不需要恶意——提示注入让模型发一个带嵌套量词的正则即可，模型自己写错也可能命中。彻底修需要把遍历放进 `worker_threads` 并透传 AbortSignal，属重构，本版未做。**规避**：pattern 避免嵌套量词（`(a+)+`、`(a|a)*`）；不确定时改用 `local_read_file` 配 offset/limit 直接看文件；不要把 `DSH_BRIDGE_LOCAL_FS` 开在无人看管的常驻链路上。
+- **默认凭据保护清单仍有漏项**（安全评审逐个实测本机存在且可读）：`~/.codex/auth.json`、`~/.config/gh/hosts.yml`、`~/.bash_history`、`~/.claude/settings.json`、`~/.openviking/ov.conf`、`~/.git-credentials`、`~/.docker/config.json`、浏览器 `Login Data`（被二进制闸门挡住 readFile 路径，但开 exec 后可绕过）。请用 `DSH_BRIDGE_FS_DENY` 自行收窄；更彻底的 `DSH_BRIDGE_FS_ALLOW` 白名单模式（只允许写指定根）尚未实现。
+- **`local_write_file` 可写 bridge-mcp 自身源码**：生产 profile 直接 `node <工作树>/src/server.mjs`，所以改写 `src/local-fs.mjs` 能永久静默移除全部防护、改写 `src/server.mjs` 能在下次启动时执行任意代码（该进程可读真 token、能打桥）。这是文件写权限的固有后果，无法在文件工具层设边界；要收窄请用 `DSH_BRIDGE_FS_DENY` 把仓库目录拉黑，或改用 `npm i -g` 的拷贝安装形态（代码落在用户目录而非工作树）。
+- **POSIX 的进程组终止未实测**：本机无 Linux/macOS/WSL 环境，`detached: true` + `process.kill(-pid)` 这条路径只有代码审查与语义推理支撑，标 **未验证**。Windows 的 `taskkill /T /F` 已实测有效（孙进程存活 5800ms → 600ms）。
 
 ## 安全注意事项
 
@@ -290,7 +339,8 @@ shell 工具"。启用时 stderr 会打一条横幅，便于在 tunnel-client �
 
 ```powershell
 npm run check   # node --check 全部源文件
-npm test        # 离线 smoke：node:http mock REST server，10 个用例全绿，不依赖真桥
+npm test        # 离线回归 122 例（桥 7 工具 smoke 10 / 本地工具 71 / monitor 10 / workflow 20 /
+                #   skills-package 3 / improvements 7 + CLI smoke），mock REST server，不依赖真桥
 ```
 
 目录结构：

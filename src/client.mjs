@@ -75,14 +75,17 @@ export function resolveToken(env = process.env) {
     const reason = err && err.code === 'ENOENT' ? '不存在' : `不可读（${err?.code ?? err?.message}）`;
     throw new TokenError('token-missing',
       `未配置 task-bridge token：env TASK_BRIDGE_TOKEN 未设置，且 token 文件 ${file} ${reason}。` +
-      '请设置 env TASK_BRIDGE_TOKEN，或让 dsh-plugin-task-bridge 生成 token 文件（可用 env TASK_BRIDGE_TOKEN_FILE 指定其他路径）。' +
+      '请设置 env TASK_BRIDGE_TOKEN，或让宿主插件 dsh-plugin-task-coordinator ≥0.27.2 的桥在挂载时自动生成该文件' +
+      '（0.27.0/0.27.1 不会生成，需手工创建，见该仓 docs/WEB-BRIDGE.md 的「① 之前：token 文件」；' +
+      '可用 env TASK_BRIDGE_TOKEN_FILE 指定其他路径）。' +
       '注意：token 只经环境变量或文件注入，绝不放进命令行参数。');
   }
   const token = raw.trim();
   if (!token) {
     throw new TokenError('token-missing',
       `未配置 task-bridge token：token 文件 ${file} 内容为空，且 env TASK_BRIDGE_TOKEN 未设置。` +
-      '请设置 env TASK_BRIDGE_TOKEN，或让 dsh-plugin-task-bridge 重新生成 token 文件。');
+      '请设置 env TASK_BRIDGE_TOKEN，或重写该 token 文件（coordinator ≥0.27.2 会在桥挂载时自动生成；' +
+      '轮换 = 直接覆写，桥与 wrapper 都会重读，无需重启）。');
   }
   return token;
 }
