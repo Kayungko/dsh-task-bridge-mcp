@@ -180,21 +180,14 @@ export function canonical(p) {
   // 注意 Windows 盘符后的 `C:` 不是流分隔符，所以从索引 2 之后开始找。
   const adsIdx = s.indexOf('::', s.length > 1 && s[1] === ':' ? 2 : 0);
   if (adsIdx >= 0) s = s.slice(0, adsIdx);
-  let real;
-  try {
-    // realpathSync.native 走 OS 原生 API：Windows 上返回带正确大小写的最终路径，
-    // 并解析 symlink/junction/UNC；比 JS 实现更准且更快。
-    real = realpathSync.native(s);
-  } catch {
-    real = resolve(s); // 不存在的路径（写新文件）：退回字符串规范化
-  }
+  const real = resolveWithAncestors(s);
   // Windows 与 macOS 默认不区分大小写；POSIX 区分，不能 lowercase（否则两个不同文件被视为同一个）
   return process.platform === 'win32' || process.platform === 'darwin' ? real.toLowerCase() : real;
 }
 
 /**
  * 展示用路径：解析真实路径（覆盖 symlink/junction/UNC）但**保留 OS 的正确大小写**。
- * 与 canonical 的区别只在不 lowercase——canonical 用于比较，displayPath 用于回执。
+ * 与 canonical 的区别**只在不 lowercase**——canonical 用于比较，displayPath 用于回执与实际落盘。
  * 0.5.1 的初版把 canonical 同时用于两者，导致回执里的路径全变小写（`C:\Users\...` →
  * `c:\users\...`），模型和用户看到的是被改写过的路径。
  */
@@ -202,27 +195,51 @@ export function displayPath(p) {
   let s = String(p ?? '').trim();
   const adsIdx = s.indexOf('::', s.length > 1 && s[1] === ':' ? 2 : 0);
   if (adsIdx >= 0) s = s.slice(0, adsIdx);
+  return resolveWithAncestors(s);
+}
+
+/**
+ * 解析路径的真实形式；**叶子不存在时逐级上溯到最近存在的祖先**做 realpath，再把剩余段拼回。
+ *
+ * 为什么必须上溯（0.5.3 P1 修复）：0.5.1 给 `displayPath` 加了祖先上溯（为还原 OS 大小写），
+ * 却**没有**同步给 `canonical`——后者在 realpath 失败时退回纯字符串 `resolve()`，不解析祖先链接。
+ * 于是「junction/symlink 祖先 + 不存在的叶子」会让两者分叉：`guardPath` 用 canonical **判定**，
+ * `writeFile` 用 displayPath **落盘**——检查在一个路径上、写入在另一个路径上。
+ *
+ * 实测端到端穿透（`.tmpfiles/verify-052/n1-junction.mjs`，15/15）：经 junction 写入受
+ * `protectedAlways` **强制保护**的文件成功，内容变成攻击者指定值；三级凭据保护连同
+ * 「不可通过配置解除」那一级全部失效。Windows 自带 `C:\Documents and Settings` → `C:\Users`
+ * 的 junction，**零前置条件**可利用（实测 `canonical('C:\Documents and Settings\admin\.ssh\
+ * authorized_keys')` 保留 junction 未解析，而 displayPath 解析成 `C:\Users\admin\.ssh\
+ * authorized_keys`）；真实后果如植入 SSH 公钥，而 `authorized_keys` 通常**不存在**，
+ * 恰好满足「叶子不存在」这个前提。
+ *
+ * 两个函数共用本 helper 后，它们只在**大小写**上不同、在**链接解析**上完全一致，
+ * 从根上消除这一类不对称（本仓已因此类不对称栽过三次：0.5.1 walk 入参、0.5.2 注入 selfRoot、
+ * 本次 canonical/displayPath 分叉）。
+ *
+ * @param {string} s 已剥 ADS 的路径
+ * @returns {string} 解析后的真实路径（保留 OS 大小写）
+ */
+function resolveWithAncestors(s) {
   try {
+    // realpathSync.native 走 OS 原生 API：Windows 上返回带正确大小写的最终路径，
+    // 并解析 symlink/junction/UNC；比 JS 实现更准且更快。
     return realpathSync.native(s);
-  } catch {
-    // 路径尚不存在（writeFile 建新文件，父目录可能也要新建）：realpath 整体失败。
-    // 逐级上溯到**最近的存在祖先**做 realpath，再把剩余段原样拼回——这样即使
-    // `a/b/c.txt` 三层都不存在，也能借 `a` 的真实大小写还原出正确形式。
-    // 否则 canonical 传进来的小写会原样出现在回执与审计行里（0.5.1 初版实测如此）。
-    const resolved = resolve(s);
-    let head = resolved;
-    const tail = [];
-    for (let i = 0; i < 40; i += 1) {
-      const parent = dirname(head);
-      if (parent === head) break;
-      tail.unshift(head.slice(head.lastIndexOf(sep) + 1));
-      head = parent;
-      try {
-        return join(realpathSync.native(head), ...tail);
-      } catch { /* 该祖先也不存在，继续上溯 */ }
-    }
-    return resolved;
+  } catch { /* 叶子不存在（writeFile 建新文件），走祖先上溯 */ }
+  const resolved = resolve(s);
+  let head = resolved;
+  const tail = [];
+  for (let i = 0; i < 40; i += 1) {
+    const parent = dirname(head);
+    if (parent === head) break;
+    tail.unshift(head.slice(head.lastIndexOf(sep) + 1));
+    head = parent;
+    try {
+      return join(realpathSync.native(head), ...tail);
+    } catch { /* 该祖先也不存在，继续上溯 */ }
   }
+  return resolved;
 }
 
 /** 前缀匹配：child 是否等于 parent 或落在 parent 子树内（两侧都必须已 canonical）。 */
@@ -377,11 +394,25 @@ export function writeProtectedPaths({ env = process.env, selfRoot = selfPackageR
  */
 export function guardPath(rawPath, {
   env = process.env,
-  op = 'read',
+  // 无默认值（0.5.3）：曾经写 `op = 'read'`，于是**漏传** op 会被解构默认值悄悄替换成
+  // 最宽松的 read，下面的白名单永远拦不到 undefined——白名单看着 fail-closed，实际被
+  // 默认值绕过，正是它要消除的那个 fail-open。去掉默认值后「漏传」与「传非法值」同样抛错。
+  // 现网 5 个调用点（755 read / 798 write / 848 read / 914 read / 1105 exec）均显式传值，
+  // 故本改动不影响既有行为，只关闭未来新增调用点漏传时的静默降级。
+  op,
   home = homedir(),
   selfRoot = selfPackageRoot(),
   auditFile = null,
+  recheck = false,
 } = {}) {
+  // op fail-closed（0.5.3）：第四级自身写保护原先用 `op === 'write'` 精确匹配，于是
+  // `'WRITE'`/`'overwrite'`/`'put'` 等任何非该字面量都**静默跳过整级**，
+  // 而拒绝文案（下面的 verb 三元）却照样说「拒绝写入」——判定与文案语义相反，
+  // 且把「未知输入」默认成了「放行」。实测现网 5 个调用点传值都正确，故非现网缺陷，
+  // 但这是 fail-open 设计，与本模块「保护默认拒绝」的原则相反。改为白名单校验。
+  if (!['read', 'write', 'exec'].includes(op)) {
+    throw new LocalToolError('invalid-params', `未知的 op：${JSON.stringify(op)}（只接受 read / write / exec）`);
+  }
   if (typeof rawPath !== 'string' || !rawPath.trim()) {
     throw new LocalToolError('invalid-params', '参数 path 缺失或不是非空字符串');
   }
@@ -458,9 +489,24 @@ export function guardPath(rawPath, {
       }
     }
   }
-  // 回执用 displayPath（保留 OS 正确大小写），比较用 canonical（小写 + 剥 ADS + 解析真实路径）。
-  // Windows 文件系统不区分大小写，所以对小写形式再跑一次 realpathSync.native 能拿回正确大小写。
-  return displayPath(abs);
+  // 回执与实际落盘都用 displayPath（保留 OS 正确大小写），比较用 canonical（小写 + 剥 ADS +
+  // 解析真实路径 + **叶子不存在时上溯解析祖先链接**）。
+  //
+  // 自校验（0.5.3，fail-closed）：真正被访问/落盘的字符串是 shown，而上面五级判定用的是 abs。
+  // 两者在 canonical 形式下必须相等。0.5.1~0.5.2 期间它们会因「junction/symlink 祖先 + 不存在的
+  // 叶子」而分叉——canonical 在 realpath 失败时退回纯字符串 resolve()（不解析祖先链接），
+  // displayPath 却上溯到最近存在祖先做 realpath，于是**判定在一个路径上、写入在另一个路径上**。
+  // 实测可经 Windows 自带的 `C:\Documents and Settings` → `C:\Users` junction 穿透全部三级
+  // 凭据保护（含"不可通过配置解除"那一级）。canonical 现已与 displayPath 共用
+  // resolveWithAncestors，正常情况下这条恒等式成立；保留它是为了将来再出现**任何**归一化差异时
+  // 走拒绝而不是放行——守的是「真正会落盘的那个字符串」本身，这比修 canonical 更能防复发。
+  const shown = displayPath(abs);
+  const shownCanonical = canonical(shown);
+  if (shownCanonical !== abs && !recheck) {
+    // 对解析后的真实路径重跑全部五级判定；recheck 防止无限递归
+    return guardPath(shown, { env, op, home, selfRoot, auditFile, recheck: true });
+  }
+  return shown;
 }
 
 /**

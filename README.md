@@ -289,6 +289,9 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
    必须落在列出的根内，`..` 穿越、大小写/ADS/UNC 变形、junction 逃逸一律以 canonical
    结果判定；递归遍历内**逐条目**生效（不是只查搜索根）。与第 ②③ 层是 AND 关系——
    **只收窄、永不放宽**。⚠️ 管不住 `local_exec` 命令里的绝对路径。
+   ⚠️ 「junction 逃逸以 canonical 判定」这句在 **0.5.2 及以前对新建文件不成立**：`canonical`
+   不解析祖先链接而 `displayPath` 解析，判定与落盘分叉，可穿透全部三级凭据保护（含本层与
+   下面第 ②③ 层）。0.5.3 起两者共用同一解析函数，该声明才真正成立——详见 CHANGELOG 0.5.3。
 5. **自身完整性保护**（0.5.2）：`local_write_file` 不得改写 bridge-mcp **自己的包目录**
    （含 append 与新建文件），也不得改写审计日志文件。生产 profile 直接
    `node <工作树>/src/server.mjs`，所以改写 `src/local-fs.mjs` 能永久静默移除全部防护、
@@ -361,11 +364,16 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
 - 被跳过的文件逐项计数并如实上报：`skipped.{oversize,binary,protected,unreadable}`，且**只要有跳过就置 `truncated=true`** 并给出 `note`——0.5.0 把超限/二进制文件静默 `continue` 却仍计入 `filesScanned`，于是「扫了 N 个、只有 1 处命中、没截断」无法区分"确实没有"与"被跳过了"。`local_list_dir` 同理报 `skippedProtected` / `depthLimited`。
 - 单文件模式（`path` 指向文件）与目录模式共用同一套 size / 二进制闸门（0.5.0 的单文件分支两者都没有：实测 `maxBytes=1024` 时仍把 200MB 文件整体读入堆，rss +392MB）。
 
-### 已知未修（0.5.2 如实披露，别按"已加固"来估风险）
+### 已知未修（0.5.3 如实披露，别按"已加固"来估风险）
 
 0.5.1 这一节列的四条，三条已在 0.5.2 修掉（ReDoS、凭据清单漏项、可改写自身源码），
 第四条（POSIX 进程组终止）从「未测死代码」升级为「分支已测、内核语义仍未验证」。
-以下是**修完之后仍然成立**的残余风险，按重要性排列：
+
+0.5.3 又修掉两项，其中一项是 **P1**：本节原先那条「junction 逃逸已实测拦住」的声明，在
+0.5.2 及以前对**新建文件**是**错的**——`canonical` 不解析祖先链接而 `displayPath` 解析，
+判定与落盘分叉，可穿透全部三级凭据保护（Windows 自带 `C:\Documents and Settings` junction
+零前置条件可利用）。本节下方那条已按实情更正，并补入同批交叉校验复核出、**本版仍未修**的
+四项。以下是**修完之后仍然成立**的残余风险，按重要性排列：
 
 - **开了 `local_exec`，所有文件级边界归零**。凭据保护、白名单、自身完整性保护全都是
   **文件工具层**的约束，而 shell 不受它们管：`type C:\Users\you\.ssh\id_rsa`、
@@ -397,9 +405,28 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
   兜底 kill 仍执行、不去 spawn `taskkill`），把「未测死代码」降级为「分支已测」。
   但「Linux 内核确实会因此杀掉整棵进程树」这一步仍标 **未验证**。Windows 的
   `taskkill /T /F` 已实测有效（孙进程存活 5800ms → 600ms）。
-- **symlink 逃逸只实测了 Windows junction**。白名单与递归保护对 junction 的逃逸已实测拦住；
-  POSIX 的 symlink 只有代码路径推理支撑（`canonical` 走 `realpathSync.native`，语义上应一致），
-  标 **未验证**。
+- **symlink 逃逸只实测了 Windows junction**。junction 逃逸已实测拦住——但这条声明**直到 0.5.3
+  才对「新建文件」成立**：0.5.2 及以前实测的是**已存在**的叶子，而 `canonical` 不解析祖先链接、
+  `displayPath` 解析，两者在「junction 祖先 + 不存在的叶子」下分叉，可穿透全部三级凭据保护
+  （即 0.5.3 修掉的 P1，Windows 自带 `C:\Documents and Settings` junction 零前置条件可利用）。
+  POSIX 的 symlink 只有代码路径推理支撑（`canonical` 与 `displayPath` 现共用
+  `resolveWithAncestors`，后者走 `realpathSync.native`，语义上应一致），标 **未验证**。
+- **受保护 basename 被当作目录名时，其后代可直读**。`isProtectedByDefault` 只看候选自身的
+  basename：名为 `auth.json` 的**目录**被判为受保护（`guardWalkEntry` 整个跳过，`listDir` /
+  `grep` 的 `skippedProtected` 计入），但其子文件 `auth.json/nested/leak.txt` 判为**不受保护**，
+  `guardPath` 放行、`readFile` 实测能读出内容——同一路径**直读能读、遍历搜不到**。现实影响比
+  字面窄：真实的 `~/.ssh` 等由 `PROTECTED_DIRS` 按**真实 home** 锚定，内容仍受保护；此项只在
+  「项目里真有一个目录叫 `auth.json` / `.env` / `credentials`」时成立。0.5.3 复核仍存在。
+- **`writeFile` 会按需创建父目录，于是能造出名为 `.env` 的目录**。实测写
+  `<x>/.env/sub/notes.txt` 成功并创建 `.env` **目录**；又因 `.ssh` 保护锚定真实 home，任意
+  `home/.ssh/config` 可写（`id_rsa` 仍被正确拒绝）。0.5.3 复核仍存在。
+- **`listDir` 不统计 readdir 失败，也没有 `skippedUnreadable` 字段**。注入 EACCES 实测：
+  `listDir` 回执无任何不可读计数（`count=3 / skippedProtected=0`），而 `grep` 对同一棵树正确报
+  `unreadable:1` + `truncated:true`。后果是 `listDir` 可能把**不完整的树**呈现为完整——与 0.5.0
+  「深度到顶静默停止下潜」是同一类问题（回执读起来像「列全了」）。0.5.3 复核仍存在。
+- **落盘失败的写不留审计行**。注入 EACCES 使 `writeFileSync` 抛错后，审计文件未被创建、logger
+  收到 0 行——一次失败的写尝试没有任何痕迹。作用域：只实测了 **fs 层失败**这条路径，策略拒绝
+  （`credential-protected` 等）是否留审计未在 0.5.3 重测，标 **未验证**。
 - **`local_write_file` 没有并发/速率闸**。0.5.2 给 `local_exec` 加了并发上限，写文件没有——
   一次扇出几百个写调用不会被拦。危害小于 exec（写有审计、有路径保护），但仍是无界资源。
 
@@ -425,8 +452,8 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
 
 ```powershell
 npm run check   # node --check 全部源文件
-npm test        # 离线回归 122 例（桥 7 工具 smoke 10 / 本地工具 71 / monitor 10 / workflow 20 /
-                #   skills-package 3 / improvements 7 + CLI smoke），mock REST server，不依赖真桥
+npm test        # 离线回归 166 例（桥 7 工具 smoke 10 / 本地工具 115 / monitor 10 / workflow 20 /
+                #   skills-package 3 / improvements 7 + CLI smoke 1），mock REST server，不依赖真桥
 ```
 
 目录结构：

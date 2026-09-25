@@ -3,9 +3,9 @@
 // 因为 shell 行为在 Windows(cmd.exe) 与 POSIX 上不同，mock 会掩盖真实差异。
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { basename, delimiter, join } from 'node:path';
 
 import {
   buildLocalTools,
@@ -15,6 +15,7 @@ import {
   auditField,
   canonical,
   createLocalTools,
+  displayPath,
   guardPath,
   guardWalkEntry,
   isProtectedByDefault,
@@ -1997,6 +1998,185 @@ test('0.5.2 win32 分支仍走 taskkill，不误用进程组信号、detached �
   assert.ok(events.some((e) => e.startsWith('taskkill:taskkill:/pid 4242 /T /F')),
     `win32 必须用 taskkill /T /F 杀树，实际 ${JSON.stringify(events)}`);
   assert.ok(!events.some((e) => e.startsWith('kill(-')), 'win32 不得走进程组信号分支');
+});
+
+// ---------------------------------------------------------------------------
+// 0.5.3 P1：junction/symlink 祖先 + **不存在的叶子** → 判定路径与落盘路径分叉
+// ---------------------------------------------------------------------------
+// 成因（0.5.1 引入，0.5.2 仍在）：displayPath 为还原 OS 正确大小写加了「叶子不存在时逐级
+// 上溯到最近存在祖先做 realpath」，却**没有**同步给 canonical——后者在 realpath 失败时退回
+// 纯字符串 resolve()，不解析祖先链接。而 guardPath 用 canonical **判定**、writeFile 用
+// displayPath **落盘**，于是检查在一个路径上、写入在另一个路径上。
+//
+// 后果：经 junction 写入 protectedAlways **强制保护**（不可配置解除）的凭据文件成功，三级
+// 凭据保护连同「不可解除」那一级全部穿透。Windows 自带 `C:\Documents and Settings` →
+// `C:\Users` junction，**零前置条件**可利用；`~/.ssh/authorized_keys` 通常不存在，恰好满足
+// 「叶子不存在」这个前提。实测脚本见仓库外 `.tmpfiles/verify-052/n1-junction.mjs`（15/15）。
+//
+// 为什么 0.5.1/0.5.2 的 109 例没抓到：既有的 symlink 用例（见「四类路径变形」）链接的是
+// **已存在**的文件，走的是 realpath 成功分支，根本不经过祖先上溯那段代码。
+//
+// 修法：抽 resolveWithAncestors 让 canonical 与 displayPath 共用，两者只在大小写上不同；
+// 并在 guardPath 末尾加恒等式自校验，对解析后的真实路径重跑全部五级判定（recheck 防递归）。
+
+/** canonical 与 displayPath 的唯一合法差异是大小写；POSIX 区分大小写，故须完全相等。 */
+function sameModuloCase(canon, display) {
+  return process.platform === 'win32' || process.platform === 'darwin'
+    ? canon === display.toLowerCase()
+    : canon === display;
+}
+
+/** 在 dir 下建一个指向 target 的 junction（POSIX 上 type 被忽略，退化为普通 symlink）。 */
+function makeJunction(dir, name, target) {
+  const lnk = join(dir, name);
+  symlinkSync(target, lnk, 'junction');
+  return lnk;
+}
+
+test('0.5.3 「junction 祖先 + 不存在的叶子」下 canonical 与 displayPath 必须收敛', (t) => {
+  const juncParent = makeTempDir();
+  const target = makeTempDir();
+  t.after(() => { cleanup(juncParent); cleanup(target); });
+
+  const lnk = makeJunction(juncParent, 'lnk-to-target', target);
+  assert.ok(statSync(target).isDirectory(), '前置：junction 目标目录存在');
+
+  const leaf = join(lnk, 'brand-new-file.txt');   // 叶子**不存在**——缺陷的触发前提
+  assert.ok(!existsSync(leaf), '前置：叶子确实不存在');
+
+  const c = canonical(leaf);
+  const d = displayPath(leaf);
+  assert.ok(sameModuloCase(c, d),
+    `判定路径与落盘路径必须指向同一物理位置，实际 canonical=${c} displayPath=${d}`);
+  assert.ok(!c.includes('lnk-to-target'),
+    `叶子不存在时 canonical 也必须解析祖先 junction，实际 ${c}`);
+
+  // 对照：叶子存在时 canonical 本来就正确——证明缺陷只在「新建」路径上，修复没动既有行为
+  writeFileSync(join(target, 'already-there.txt'), 'x', 'utf8');
+  const existing = join(lnk, 'already-there.txt');
+  assert.ok(!canonical(existing).includes('lnk-to-target'), '叶子存在时必须解析 junction');
+  assert.ok(sameModuloCase(canonical(existing), displayPath(existing)), '叶子存在时也必须收敛');
+});
+
+test('0.5.3 P1：经 junction 写「强制保护」的凭据文件必须被拒（端到端查落盘）', (t) => {
+  const juncParent = makeTempDir();
+  const protDir = makeTempDir();
+  t.after(() => { cleanup(juncParent); cleanup(protDir); });
+
+  // 故意**不创建**：模拟攻击者新建受保护文件，也正是缺陷的触发前提
+  const protectedToken = join(protDir, 'task-bridge-token');
+  const env = { DSH_BRIDGE_LOCAL_FS: '1', TASK_BRIDGE_TOKEN_FILE: protectedToken };
+  const { impl } = makeImpl(env);
+
+  // 前置自证：该路径确实在「不可配置解除」那一层里，否则本用例什么都测不到
+  assert.ok(protectedAlways(env).includes(canonical(protectedToken)),
+    '前置：合成 token 必须在 protectedAlways 清单内');
+
+  // 直接路径被拒——证明保护本身有效，不是靠别的分支偶然挡住
+  assert.throws(() => guardPath(protectedToken, { env, op: 'write' }),
+    (e) => e.code === 'credential-protected', '直接写必须被拒');
+
+  const lnk = makeJunction(juncParent, 'lnk-to-prot', protDir);
+  const attackPath = join(lnk, 'task-bridge-token');   // 叶子不存在
+  assert.equal(canonical(attackPath), canonical(protectedToken),
+    '前置：修复后攻击路径必须 canonical 到受保护的真实路径');
+
+  assert.throws(() => guardPath(attackPath, { env, op: 'write' }),
+    (e) => e.code === 'credential-protected',
+    '经 junction 的同一目标必须同样被拒（0.5.2 在此放行并返回真实路径）');
+  assert.throws(() => impl.writeFile({ path: attackPath, content: 'ATTACKER-CONTROLLED-VALUE' }),
+    (e) => e.code === 'credential-protected', 'writeFile 必须被拒');
+  assert.ok(!existsSync(protectedToken),
+    `受保护路径不得被创建/写入，实际内容=${existsSync(protectedToken) ? readFileSync(protectedToken, 'utf8') : 'n/a'}`);
+});
+
+test('0.5.3 Windows 自带 junction 不得成为零前置条件的绕过通道', (t) => {
+  if (process.platform !== 'win32') { t.skip('仅 Windows 有 Documents and Settings junction'); return; }
+  const builtin = 'C:\\Documents and Settings';
+  let isLink = false;
+  try { isLink = lstatSync(builtin).isSymbolicLink(); } catch { t.skip(`${builtin} 不可 stat`); return; }
+  if (!isLink) { t.skip(`${builtin} 不是 junction`); return; }
+
+  // authorized_keys 通常不存在 → 满足「叶子不存在」前提；这正是可植入 SSH 公钥的现实路径
+  const probe = join(builtin, basename(homedir()), '.ssh', 'authorized_keys');
+  const c = canonical(probe);
+  assert.ok(sameModuloCase(c, displayPath(probe)),
+    `自带 junction 下两者必须收敛，实际 canonical=${c} displayPath=${displayPath(probe)}`);
+  assert.ok(!c.includes('documents and settings'),
+    `canonical 必须解析到真实的 C:\\Users 下，实际 ${c}`);
+});
+
+test('0.5.3 guardPath 恒等式：返回的落盘路径必须与入参 canonical 相等（含 junction）', (t) => {
+  const dir = makeTempDir();
+  const juncParent = makeTempDir();
+  const target = makeTempDir();
+  t.after(() => { cleanup(dir); cleanup(juncParent); cleanup(target); });
+  const env = { DSH_BRIDGE_LOCAL_FS: '1' };
+
+  // 无链接的三种形态：已存在文件 / 多层不存在的新建路径 / 目录本身
+  const plain = [join(dir, 'a.txt'), join(dir, 'no', 'such', 'deep', 'b.txt'), dir];
+
+  // 有链接的形态：junction 下的已存在叶子与**不存在**的叶子（后者正是 0.5.2 分叉的那条）
+  const lnk = makeJunction(juncParent, 'lnk-identity', target);
+  writeFileSync(join(target, 'there.txt'), 'x', 'utf8');
+  const linked = [
+    join(lnk, 'there.txt'),
+    join(lnk, 'brand-new.txt'),                      // 叶子不存在
+    join(lnk, 'deep', 'deeper', 'brand-new2.txt'),   // 叶子与父目录都不存在
+  ];
+
+  for (const p of [...plain, ...linked]) {
+    const shown = guardPath(p, { env, op: 'write' });
+    assert.equal(canonical(shown), canonical(p),
+      `guardPath 返回值必须与入参指向同一物理位置：${shown} vs ${p}`);
+  }
+  // 链接形态还须**真的解析掉** junction——否则上面的恒等式会因两侧都没解析而侥幸成立
+  for (const p of linked) {
+    assert.ok(!canonical(p).includes('lnk-identity'),
+      `canonical 必须解析 junction，不得保留链接名：${canonical(p)}`);
+  }
+});
+
+test('0.5.3 op 白名单 fail-closed：未知或**缺失**的 op 一律抛 invalid-params', () => {
+  const dir = makeTempDir();
+  const env = { DSH_BRIDGE_LOCAL_FS: '1' };
+  const p = join(dir, 'x.txt');
+
+  // 第四级自身写保护原先用 `op === 'write'` 精确匹配，任何非该字面量都**静默跳过整级**，
+  // 而拒绝文案照样说「拒绝写入」——判定与文案语义相反，且把未知输入默认成放行。
+  for (const bad of ['WRITE', 'Write', 'overwrite', 'put', 'delete', '', null, 0, 1, {}, [], NaN]) {
+    assert.throws(() => guardPath(p, { env, op: bad }),
+      (e) => e.code === 'invalid-params', `op=${JSON.stringify(bad)} 必须被拒`);
+  }
+  // 漏传 / undefined：曾经签名里写 `op = 'read'`，解构默认值把 undefined 悄悄换成最宽松的
+  // read，于是白名单永远拦不到它——白名单看着 fail-closed，实际被默认值绕过。
+  assert.throws(() => guardPath(p, { env }),
+    (e) => e.code === 'invalid-params', '漏传 op 必须被拒，不得默认成 read');
+  assert.throws(() => guardPath(p, { env, op: undefined }),
+    (e) => e.code === 'invalid-params', 'op=undefined 必须被拒');
+  for (const good of ['read', 'write', 'exec']) {
+    assert.doesNotThrow(() => guardPath(p, { env, op: good }), `op=${good} 必须仍被接受`);
+  }
+});
+
+test('0.5.3 过度拒绝检查：junction 指向的非受保护目录仍须可读写', (t) => {
+  const juncParent = makeTempDir();
+  const target = makeTempDir();
+  t.after(() => { cleanup(juncParent); cleanup(target); });
+
+  const lnk = makeJunction(juncParent, 'lnk-ok', target);
+  const { impl } = makeImpl({});
+  const viaLink = join(lnk, 'legit.txt');
+
+  const ret = impl.writeFile({ path: viaLink, content: 'LEGIT-VIA-JUNCTION' });
+  assert.ok(existsSync(join(target, 'legit.txt')), '写入必须真的落在 junction 目标目录');
+  assert.equal(readFileSync(join(target, 'legit.txt'), 'utf8'), 'LEGIT-VIA-JUNCTION');
+  if (process.platform === 'win32') {
+    assert.match(String(ret.path), /[A-Z]/,
+      '回执 path 须保留 OS 正确大小写（0.5.1 的回执修复不得因本次收敛而回退）');
+  }
+  assert.ok(String(impl.readFile({ path: viaLink }).content).includes('LEGIT-VIA-JUNCTION'),
+    '经 junction 读回内容必须正确');
 });
 
 

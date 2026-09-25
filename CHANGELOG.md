@@ -1,5 +1,99 @@
 # Changelog
 
+## [0.5.3] - 2026-09-25
+
+安全修复版：修掉一个能**穿透全部三级凭据保护**（含「不可通过配置解除」那一级）的路径归一化
+不对称缺陷，以及一个让自身写保护整级静默失效的 `op` fail-open 设计。两项都先端到端复现、
+再修、再用「新用例必须在旧代码上失败」的方式确认钉子有效。本版**不含**新功能。
+
+### P1：junction 祖先 + 不存在的叶子 → 判定路径与落盘路径分叉
+
+0.5.1 为了把回执里的路径还原成 OS 正确大小写（`c:\users\…` → `C:\Users\…`），给 `displayPath`
+加了「叶子不存在时逐级上溯到**最近存在的祖先**做 realpath，再把剩余段拼回」。但**没有**同步给
+`canonical`——后者在 realpath 失败时退回纯字符串 `resolve()`，**不解析祖先链接**。
+
+而 `guardPath` 用 `canonical` 做**判定**、`writeFile` 用 `displayPath` 做**落盘**。于是
+「junction/symlink 祖先 + 不存在的叶子」让两者指向不同物理位置：**检查在一个路径上、写入在另一个
+路径上**。受保护清单是按 canonical 形式比的，攻击路径的 canonical 里还留着未解析的 junction 名，
+自然比不中。
+
+实测端到端穿透（`.tmpfiles/verify-052/n1-junction.mjs`，15/15，在 0.5.2 代码上）：
+
+- 经 junction 写入受 `protectedAlways` **强制保护**的合成 token 文件**成功**，内容变成
+  `ATTACKER-CONTROLLED-VALUE`；同一路径**直接写**则被正确拒绝（`credential-protected`），
+  证明保护本身有效、绕过完全来自归一化不对称。
+- **零前置条件**可利用：Windows 自带 `C:\Documents and Settings` → `C:\Users` 的 junction
+  （本机 `lstatSync().isSymbolicLink() === true` 实测）。
+  `canonical('C:\Documents and Settings\admin\.ssh\authorized_keys')` 在 0.5.2 上保留 junction
+  未解析，而 `displayPath` 解析成 `C:\Users\admin\.ssh\authorized_keys`。真实后果如**植入 SSH
+  公钥**——而 `authorized_keys` 通常**不存在**，恰好满足「叶子不存在」这个触发前提。
+
+修法：抽出 `resolveWithAncestors`，让 `canonical` 与 `displayPath` **共用**同一段解析逻辑，两者
+从此只在**大小写**上不同、在链接解析上完全一致；并在 `guardPath` 末尾加恒等式自校验——真正落盘的
+字符串 `shown` 必须满足 `canonical(shown) === abs`，不成立就对解析后的真实路径**重跑全部五级判定**
+（`recheck` 标志防无限递归）。保留自校验是因为它守的是「真正会落盘的那个字符串」本身，比只修
+`canonical` 更能防复发：本仓已因同一类不对称栽过三次（0.5.1 walk 入参、0.5.2 注入 selfRoot、
+本次 canonical/displayPath 分叉）。
+
+### `op` 参数 fail-open：白名单被解构默认值绕过
+
+第四级「自身完整性保护」原先用 `op === 'write'` 精确匹配，于是 `'WRITE'` / `'overwrite'` /
+`'put'` 等任何非该字面量都**静默跳过整级**，而拒绝文案里的 verb 三元照样说「拒绝写入」——判定与
+文案语义相反，且把「未知输入」默认成了「放行」。改为白名单校验（只接受 `read` / `write` / `exec`，
+其余抛 `invalid-params`）。
+
+加白名单后又发现它**拦不到漏传**：签名里的 `op = 'read'` 默认值会在解构阶段把 `undefined` 悄悄
+换成最宽松的 `read`，白名单永远看不到它——白名单看着 fail-closed，实际被默认值绕过，正是它要
+消除的那个 fail-open。故一并去掉默认值，让「漏传」与「传非法值」同样抛错。
+
+现网 5 个调用点（`local-fs.mjs` 755 read / 798 write / 848 read / 914 read / 1105 exec）**均显式
+传值**，故本项不是现网缺陷，166 例回归也未受影响；它关闭的是未来新增调用点漏传时的静默降级。
+
+### 验证
+
+- `npm run check` 通过；`npm test` **166 例全绿**（0.5.2 为 160 例，本版新增 6 例）。
+- 新增 6 例中 **5 例在 HEAD（0.5.2）代码上失败**——这是钉子的有效性证明，做法是
+  `git show HEAD:src/local-fs.mjs > src/local-fs.mjs` 换回旧代码跑一遍，再按 sha256
+  （`65603fe3…`）核对恢复。第 6 例（junction 正常用法的**过度拒绝**检查）设计上双向都该通过：
+  修复不得把合法 junction 读写一并禁掉。
+- 独立验收脚本 `.tmpfiles/verify-053/fix-check.mjs`：**31/31，exit 0**，12 个存活标记齐备。
+  断言方向与 repro **相反**（repro 证实缺陷存在，本脚本证实缺陷已堵），故重写而非复用；
+  正向存活标记（普通路径读写正常、junction 正常用法可用）放在最前，避免把「脚本自己坏了」
+  误读成「防护生效」。
+- 仓库内既有 symlink 用例为什么没抓到：它链接的是**已存在**的文件，走 realpath 成功分支，
+  根本不经过祖先上溯那段代码。新增用例显式覆盖「叶子不存在」与「叶子与父目录都不存在」。
+
+### 文档更正
+
+0.5.2 的 README 有两处声明在当时是**错的**，本版更正：
+
+- 第 ④ 层写「junction 逃逸一律以 canonical 结果判定」——对**新建文件**不成立（即本版的 P1）。
+- 「已知未修」写「白名单与递归保护对 junction 的逃逸已实测拦住」——实测的是**已存在**的叶子，
+  新建叶子那条从未被测过。
+
+### 本版未修（在 0.5.3 代码上重跑 `.tmpfiles/xcheck-fulldisk/repro.mjs` 复核，非沿用旧结论）
+
+以下四项来自同一批交叉校验，与本版修的两项是**不同缺陷**，均**仍然存在**：
+
+- **受保护 basename 被当作目录名时，其后代可直读（判定不一致）**。`isProtectedByDefault` 对
+  名为 `auth.json` 的**目录**返回 `true`，对其子文件返回 `false`，于是 `guardPath` 放行直读
+  （实测 `readFile` 成功返回内容），而 `guardWalkEntry` 把整个目录跳过（`listDir` / `grep` 的
+  `skippedProtected` 均为 1）——同一路径**直读能读、遍历搜不到**。现实影响比字面窄：真实的
+  `~/.ssh` 等由 `PROTECTED_DIRS` 按**真实 home** 锚定，其内容仍受保护；此项只在「项目里真有
+  一个目录叫 `auth.json` / `.env` / `credentials`」时成立。
+- **`writeFile` 会按需创建父目录，于是能造出一个名为 `.env` 的目录**。实测写
+  `<x>/.env/sub/notes.txt` 成功并创建了 `.env` **目录**（`isDirectory() === true`）。
+  另外 `.ssh` 保护锚定真实 home，所以任意 `home/.ssh/config` 可写（`id_rsa` 仍被正确拒绝）。
+  注：该 repro 的 B4 标签（`plain.env`「应被拒」）是**误标**——`plain.env` 不匹配
+  `/^\.env(\..*)?$/i`，放行才是正确行为。
+- **`listDir` 不统计 readdir 失败，且没有 `skippedUnreadable` 字段**。注入 EACCES 后实测
+  `listDir` 回执字段为 `ok,path,recursive,count,truncated,depthLimited,skippedProtected,entries`
+  （无 `skippedUnreadable`），`count=3 / skippedProtected=0`；而 `grep` 对同一棵树正确报
+  `unreadable:1` 且 `truncated:true`。后果是 `listDir` 可能把**不完整的树**呈现为完整。
+- **落盘失败的写不留审计行**。注入 EACCES 使 `writeFileSync` 抛错后，审计文件**未被创建**、
+  logger 收到 **0 行**——一次失败的写尝试没有任何痕迹。作用域说明：本次只实测了 **fs 层失败**
+  这条路径，策略拒绝（`credential-protected` 等）是否留审计未在本版重测。
+
 ## [0.5.2] - 2026-09-24
 
 0.5.1 的「已知未修」四条，本版修掉三条，第四条从「未测死代码」升级为「分支已测、内核语义仍未验证」。
