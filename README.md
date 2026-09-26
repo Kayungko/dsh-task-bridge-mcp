@@ -281,10 +281,20 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
      `kubeconfig`/`netrc`/`pgpass`/`npmrc`/`pypirc`、
      shell 与 REPL 历史（`.bash_history`/`.zsh_history`/`.psql_history`/`.lesshst` 等——
      人手粘贴过的 token 会长期留在这里）、Chromium 系 `Login Data` 与 `Local State`
+   - ⚠️ 上面这些名字**作为目录名同样命中，且连带保护整个子树**（0.5.4）。此前只测路径自身的
+     basename，于是一个名为 `auth.json` 的**目录**被判受保护（遍历会跳过它），但它的子文件
+     `auth.json/nested/leak.txt` 判为不受保护、`guardPath` 放行直读——同一条路径「直读能读、
+     遍历搜不到」。现在两侧一致。同理 `writeFile` 不能再借「按需创建父目录」造出一个名为
+     `.env` 的目录。代价：项目里若真有叫 `credentials` / `.env` / `auth.json` 的目录（测试
+     fixture、mock 数据），其子树会一并不可访问——用 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0`
+     解除（启动打强告警），与本层既有语义一致，**不**新增「不可解除」级别。
 
    刻意**没有**纳入的常见误伤项：`tokens.json`（设计系统的 design tokens）、`auth.spec.ts`、
    `credentials.yaml.example`、`state.json`。完整清单见 `src/local-fs.mjs` 的
-   `PROTECTED_DIRS` / `PROTECTED_NAME_PATTERNS`，两者都有逐条测试钉子。
+   `PROTECTED_DIRS` / `PROTECTED_NAME_PATTERNS`，两者都有逐条测试钉子（含 21 个「必须仍可访问」
+   的误伤对照，以及一条钉住「合并正则不得被外层锚定收紧」的用例——`PROTECTED_NAME_PATTERNS`
+   里有三条是 substring 语义，若给合并结果误加 `^…$`，`foo.pem`、`x-credentials.json` 会静默
+   漏掉，保护变窄而不报错）。
 4. **白名单模式**（`DSH_BRIDGE_FS_ALLOW`，0.5.2）：设置后所有文件工具路径与 exec 的 cwd
    必须落在列出的根内，`..` 穿越、大小写/ADS/UNC 变形、junction 逃逸一律以 canonical
    结果判定；递归遍历内**逐条目**生效（不是只查搜索根）。与第 ②③ 层是 AND 关系——
@@ -364,7 +374,7 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
 - 被跳过的文件逐项计数并如实上报：`skipped.{oversize,binary,protected,unreadable}`，且**只要有跳过就置 `truncated=true`** 并给出 `note`——0.5.0 把超限/二进制文件静默 `continue` 却仍计入 `filesScanned`，于是「扫了 N 个、只有 1 处命中、没截断」无法区分"确实没有"与"被跳过了"。`local_list_dir` 同理报 `skippedProtected` / `depthLimited`。
 - 单文件模式（`path` 指向文件）与目录模式共用同一套 size / 二进制闸门（0.5.0 的单文件分支两者都没有：实测 `maxBytes=1024` 时仍把 200MB 文件整体读入堆，rss +392MB）。
 
-### 已知未修（0.5.3 如实披露，别按"已加固"来估风险）
+### 已知未修（0.5.4 如实披露，别按"已加固"来估风险）
 
 0.5.1 这一节列的四条，三条已在 0.5.2 修掉（ReDoS、凭据清单漏项、可改写自身源码），
 第四条（POSIX 进程组终止）从「未测死代码」升级为「分支已测、内核语义仍未验证」。
@@ -372,8 +382,11 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
 0.5.3 又修掉两项，其中一项是 **P1**：本节原先那条「junction 逃逸已实测拦住」的声明，在
 0.5.2 及以前对**新建文件**是**错的**——`canonical` 不解析祖先链接而 `displayPath` 解析，
 判定与落盘分叉，可穿透全部三级凭据保护（Windows 自带 `C:\Documents and Settings` junction
-零前置条件可利用）。本节下方那条已按实情更正，并补入同批交叉校验复核出、**本版仍未修**的
-四项。以下是**修完之后仍然成立**的残余风险，按重要性排列：
+零前置条件可利用）。
+
+0.5.4 修掉了 0.5.3 记在这里的四条（受保护目录名连带子树、`.env` 目录、`listDir` 漏计
+readdir 失败、落盘失败的写不留审计），它们已从本节移除，详见 CHANGELOG 0.5.4。
+以下是**修完之后仍然成立**的残余风险，按重要性排列：
 
 - **开了 `local_exec`，所有文件级边界归零**。凭据保护、白名单、自身完整性保护全都是
   **文件工具层**的约束，而 shell 不受它们管：`type C:\Users\you\.ssh\id_rsa`、
@@ -411,22 +424,11 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
   （即 0.5.3 修掉的 P1，Windows 自带 `C:\Documents and Settings` junction 零前置条件可利用）。
   POSIX 的 symlink 只有代码路径推理支撑（`canonical` 与 `displayPath` 现共用
   `resolveWithAncestors`，后者走 `realpathSync.native`，语义上应一致），标 **未验证**。
-- **受保护 basename 被当作目录名时，其后代可直读**。`isProtectedByDefault` 只看候选自身的
-  basename：名为 `auth.json` 的**目录**被判为受保护（`guardWalkEntry` 整个跳过，`listDir` /
-  `grep` 的 `skippedProtected` 计入），但其子文件 `auth.json/nested/leak.txt` 判为**不受保护**，
-  `guardPath` 放行、`readFile` 实测能读出内容——同一路径**直读能读、遍历搜不到**。现实影响比
-  字面窄：真实的 `~/.ssh` 等由 `PROTECTED_DIRS` 按**真实 home** 锚定，内容仍受保护；此项只在
-  「项目里真有一个目录叫 `auth.json` / `.env` / `credentials`」时成立。0.5.3 复核仍存在。
-- **`writeFile` 会按需创建父目录，于是能造出名为 `.env` 的目录**。实测写
-  `<x>/.env/sub/notes.txt` 成功并创建 `.env` **目录**；又因 `.ssh` 保护锚定真实 home，任意
-  `home/.ssh/config` 可写（`id_rsa` 仍被正确拒绝）。0.5.3 复核仍存在。
-- **`listDir` 不统计 readdir 失败，也没有 `skippedUnreadable` 字段**。注入 EACCES 实测：
-  `listDir` 回执无任何不可读计数（`count=3 / skippedProtected=0`），而 `grep` 对同一棵树正确报
-  `unreadable:1` + `truncated:true`。后果是 `listDir` 可能把**不完整的树**呈现为完整——与 0.5.0
-  「深度到顶静默停止下潜」是同一类问题（回执读起来像「列全了」）。0.5.3 复核仍存在。
-- **落盘失败的写不留审计行**。注入 EACCES 使 `writeFileSync` 抛错后，审计文件未被创建、logger
-  收到 0 行——一次失败的写尝试没有任何痕迹。作用域：只实测了 **fs 层失败**这条路径，策略拒绝
-  （`credential-protected` 等）是否留审计未在 0.5.3 重测，标 **未验证**。
+- **策略拒绝（`credential-protected` 等）是否留审计行，未验证**。0.5.4 修的是 **fs 层失败**
+  这条路径（注入 EACCES 后审计文件确实生成、`result=FAILED` + `errorCode` 落行）；而
+  `guardPath` 在**进工具之前**就抛出的策略拒绝走的是另一条路径，本版没有实测它是否留痕。
+  直觉上它不留（审计调用点在 guard 之后），若成立则「被挡下的敏感路径访问尝试」无痕——
+  而那恰恰是最该留痕的信号。标 **未验证**，不要按「所有失败都有审计」来估。
 - **`local_write_file` 没有并发/速率闸**。0.5.2 给 `local_exec` 加了并发上限，写文件没有——
   一次扇出几百个写调用不会被拦。危害小于 exec（写有审计、有路径保护），但仍是无界资源。
 
@@ -452,8 +454,9 @@ PowerShell profile、`~/.claude/settings.json` 的 hooks、`.git/hooks/*` 同理
 
 ```powershell
 npm run check   # node --check 全部源文件
-npm test        # 离线回归 166 例（桥 7 工具 smoke 10 / 本地工具 115 / monitor 10 / workflow 20 /
-                #   skills-package 3 / improvements 7 + CLI smoke 1），mock REST server，不依赖真桥
+npm test        # 离线回归 179 例（桥 7 工具 smoke 10 / 本地工具 115 + 0.5.4 专册 13 / monitor 10 /
+                #   workflow 20 / skills-package 3 / improvements 7 + CLI smoke 1），
+                #   mock REST server，不依赖真桥
 ```
 
 目录结构：

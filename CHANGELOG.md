@@ -1,5 +1,102 @@
 # Changelog
 
+## [0.5.4] - 2026-09-26
+
+安全与正确性修复版：清空 0.5.3 记在「本版未修」的四项。四项都出自同一批交叉校验，且都已在
+**0.5.3 代码上重跑** `.tmpfiles/xcheck-fulldisk/repro.mjs` 复核确认仍然存在——不是从 0.5.2 的
+结论直接搬过来的。本版**含一处回执字段语义变更**（`local_list_dir` 的 `truncated`），见下。
+
+### ①② 受保护名字用作目录名时，子树连带保护
+
+`isProtectedByDefault` 此前只测路径**自身的 basename**。于是一个名为 `auth.json` 的**目录**
+自身命中保护（`guardWalkEntry` 把整个目录跳过，`listDir` / `grep` 的 `skippedProtected` 计入），
+但它的子文件 `auth.json/nested/leak.txt` 的 basename 是 `leak.txt` → 不命中 → `guardPath`
+**放行直读**。实测 0.5.3：`readFile` 成功返回内容，而同一棵树的 `listDir` / `grep` 什么都搜不到
+——同一条路径「直读能读、遍历搜不到」，两个共用同一份清单的判定给出相反答案。
+
+同源的 ②：`writeFile` 会按需创建父目录，于是写 `<x>/.env/sub/notes.txt` 在 0.5.3 上**成功**并
+创建出一个真实的 `.env` **目录**（`isDirectory() === true`）。
+
+修法：`isProtectedByDefault` 改为测**路径上的每一个段**，任一段命中即保护。因为 `guardPath` 与
+`guardWalkEntry` 共用这个函数，改一处两侧同时生效，一致性是结构性的而非靠两边各自打补丁。
+
+语义由用户选定：**连带保护整个子树**，且可用 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0` 解除（启动打
+强告警）——与本层（第③层）既有语义一致，**不**新增「不可解除」级别；那一级仍只留给本链路自己
+的凭据（桥 token / `.credentials.yaml`），本版专门加了用例钉住「解除开关不得连带打开强制保护」。
+
+代价如实写明：项目里若真有叫 `credentials` / `.env` / `auth.json` 的目录（测试 fixture、mock
+数据、第三方仓常见），其子树会一并不可访问，需显式解除或改目录名。这是「消除判定不一致」的两个
+可能方向里更安全的那个（另一个方向是让遍历也不跳过，那会让 `grep` 扫出该目录内容、保护面变小）。
+
+现实影响范围：真实的 `~/.ssh`、`~/.aws` 等由 `PROTECTED_DIRS` 按**真实 home** 锚定，其内容在
+0.5.3 上本来就受保护；①② 只在「项目内存在这类同名目录」时成立。
+
+### 性能：合并正则，且等价性经实测
+
+改成逐段测试后，正则测试次数乘以了路径深度；而 `guardWalkEntry` 对递归遍历的**每个条目**都调它，
+一次 2000 文件的 `local_grep` 就是 2000 × 深度 × 15 条正则。故预编译一条合并正则
+（`PROTECTED_NAME_ANY`），每段只测一次。
+
+合并的等价性是**实测**的，不是推断：`PROTECTED_NAME_PATTERNS` 里有三条是 substring 语义
+（`\.(pem|p12|pfx|key|ppk)$`、`(^|[^a-z])credentials?\.(json|ya?ml)$`、
+`(^|[\\/\.])(kubeconfig|netrc|…)$`），若给合并结果误加外层 `^…$`，它们会被收紧成「整段完全
+匹配」，于是 `foo.pem`、`x-credentials.json` 这类**本该命中**的名字静默漏掉——保护变窄而不报错，
+比漏计更危险。用 58 个名字（含这三条的关键边界）逐一对比「逐条 test 取或」与「合并 test」，
+不一致数 **0**；仓库内另有 49 个「必须仍受保护」+ 21 个「不得误伤」的常驻钉子。
+
+### ③ `local_list_dir` 统计 readdir 失败（**含回执语义变更**）
+
+0.5.3 及以前，递归列举遇到不可读子目录是**静默 `return`**：回执的 `count` / `truncated` /
+`skippedProtected` 全都正常，调用方无从得知少了一整棵子树，于是把**不完整的树**读成完整。这与
+0.5.0「深度到顶静默停止下潜」是同一类缺陷（回执读起来像「列全了」），而 `local_grep` 对同一棵树
+本来就有 `skipped.unreadable` 计数——两个工具口径不一致。
+
+修法与**语义变更**：
+
+- 新增 `skippedUnreadable` 计数（与 `grep` 的 `skipped.unreadable` 对齐）。
+- ⚠️ `truncated` 的含义从「被 limit 截断」改为「**结果不完整**」（任何原因），与 `local_grep`
+  的既有约定一致；狭义标志改名 `limitTruncated`。**这是行为变更**：此前有子目录读不了时
+  `truncated:false`，现在是 `true`。照旧只看 `truncated` 判断「是否被 limit 截断」的调用方需改看
+  `limitTruncated`。这样改的理由是 0.5.0 的教训本身——`truncated:false` 被读成「列全了」正是要防
+  的事，让它继续表示狭义截断等于把同一个坑留在另一个工具里。
+- `depthLimited` 保留为独立字段（细分原因），同时并入广义 `truncated`。
+- `note` 现在逐条说明不完整的原因（limit / 深度 / 保护跳过 / 不可读）。
+- 工具 description 与 outputSchema 同步更新：原文那句「无权限的子目录**静默**跳过」已不成立。
+
+### ④ 落盘失败的写也留审计行
+
+0.5.3：`mkdirSync` / `writeFileSync` / `appendFileSync` 抛错会直接冒泡，后面的 `audit()` 永远
+不执行。实测注入 EACCES 后审计文件**根本没被创建**、logger 收到 **0 行**——一次失败的写尝试不留
+任何痕迹。而「失败的写」恰恰最该留痕：它可能是权限边界被探测的信号，也可能是敏感路径写入被挡下
+的证据，而审计是这条链路对外宣称的唯一补偿性控制（网页侧无人在环）。
+
+修法：把建目录与落盘包进 try，失败时写一条 `result=FAILED errorCode=<code> intendedBytes=<n>`
+的审计行再重新抛出（错误仍如实冒泡给调用方）。成功路径补 `result=ok`，两条路径可区分。
+`errorCode` 走 `auditField` 转义——它是 fs 给的字符串，可信度高于调用方输入，但审计的防注入纪律
+不该对字段来源做假设（0.5.2 的教训）；有用例专门注入含 LF 的假 errorCode，断言审计文件仍只有
+1 行、注入的 `AUDIT local_exec` 不得成为独立记录。
+
+作用域：本项只覆盖 **fs 层失败**。`guardPath` 在进工具之前就抛出的**策略拒绝**
+（`credential-protected` 等）走另一条路径，本版**未实测**它是否留痕，标 **未验证**并写进 README
+的「已知未修」——直觉上它不留（审计调用点在 guard 之后），若成立则「被挡下的敏感路径访问尝试」
+无痕。不要按「所有失败都有审计」来估。
+
+### 验证
+
+- `npm run check` 通过；`npm test` **179/179**（0.5.3 为 166，本版新增 13 例，独立成
+  `test/local-fs-054.test.mjs`——既有文件已 2000+ 行，且本批断言自带 helper 需求）。
+- 13 个新用例中 **11 个在 HEAD（0.5.3）代码上失败**，做法与 0.5.3 相同：
+  `git show HEAD:src/local-fs.mjs > src/local-fs.mjs` 换回旧代码跑一遍，再按 sha256
+  （`7f79abc6…`）核对恢复。另外 2 个（「合并正则未被收紧」与「普通目录名不受影响」）是防**我**
+  改错的守卫，设计上双向都该通过。
+- 独立 repro 交叉验证（`.tmpfiles/xcheck-fulldisk/repro.mjs`，非本仓测试）：A2/A4/A5 从
+  NO-THROW 翻转为 `credential-protected`、B1 同样翻转、B2 的 `.env` 目录从「已创建」变为
+  「未创建」、D1 回执字段新增 `limitTruncated`/`skippedUnreadable`/`note`、D2 的 `truncated`
+  从 `false` 变 `true`、D3 从 `false` 变 `true`、E2 审计文件从「未生成」变「已生成」、E3 的
+  logger 行数从 0 变 1。
+- 该 repro 自身在 B3 崩了一次：它 `statSync('<x>/.env')` 未做容错，而 0.5.4 起该目录不再被创建
+  → ENOENT。这是修复生效的副作用，不是回归；已给 repro 加容错（脚本在仓库外，不入版本管理）。
+
 ## [0.5.3] - 2026-09-25
 
 安全修复版：修掉一个能**穿透全部三级凭据保护**（含「不可通过配置解除」那一级）的路径归一化

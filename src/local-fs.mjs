@@ -318,6 +318,25 @@ export const PROTECTED_NAME_PATTERNS = [
   /^local state$/i,
 ];
 
+/**
+ * `PROTECTED_NAME_PATTERNS` 的预编译合并版（0.5.4）。
+ *
+ * 为什么需要合并：`isProtectedByDefault` 从「只测自身 basename」扩展成「测路径上每一个段」后，
+ * 正则测试次数乘以了路径深度；而 `guardWalkEntry` 对递归遍历的**每个条目**都调它，一次
+ * 2000 文件的 `local_grep` 就是 2000 × 深度 × 15 条正则。合并后每段只测一次。
+ *
+ * 等价性（改这里前必须读懂）：各 `source` **自带自己的边界**——多数是 `^…$`，但有三条是
+ * substring 语义（`\.(pem|p12|pfx|key|ppk)$`、`(^|[^a-z])credentials?\.(json|ya?ml)$`、
+ * `(^|[\\/.])(kubeconfig|netrc|…)$`）。所以只能用 `(?:a)|(?:b)|…` 拼接，**绝不能**给合并结果
+ * 再加一层外层 `^…$`——那会把这三条错误地收紧成「整段完全匹配」，于是 `foo.pem`、
+ * `x-credentials.json` 这类**本该命中**的名字全部漏掉，保护静默变窄。
+ * 逐条 `test` 取或 与 合并后 `test`，结果完全一致。无 `/g` 标志，故无 `lastIndex` 状态问题。
+ */
+const PROTECTED_NAME_ANY = new RegExp(
+  PROTECTED_NAME_PATTERNS.map((re) => `(?:${re.source})`).join('|'),
+  'i',
+);
+
 /** 判断一个已 canonical 的绝对路径是否落在默认保护范围内。 */
 export function isProtectedByDefault(absPath, home = homedir()) {
   const p = canonical(absPath);
@@ -325,8 +344,19 @@ export function isProtectedByDefault(absPath, home = homedir()) {
   for (const dir of PROTECTED_DIRS) {
     if (withinTree(p, canonical(join(homeCanonical, dir)))) return true;
   }
-  const base = p.slice(p.lastIndexOf(sep) + 1);
-  return PROTECTED_NAME_PATTERNS.some((re) => re.test(base));
+  // 0.5.4：测**路径上的每一个段**，不再只测自身 basename。
+  //
+  // 起因（0.5.0 起就在，0.5.3 复核确认仍存在）：只测 basename 时，一个名为 `auth.json` 的
+  // **目录**自身命中保护（`guardWalkEntry` 于是把整个目录跳过，listDir/grep 的
+  // `skippedProtected` 计入），但它的子文件 `auth.json/nested/leak.txt` 的 basename 是
+  // `leak.txt` → 不命中 → `guardPath` **放行直读**。于是同一条路径「直读能读、遍历搜不到」，
+  // 两个共用同一份清单的判定给出相反答案。连带保护子树后两侧一致。
+  //
+  // 这一层仍受 `denyCredentials` 门控（调用方 guardPath / guardWalkEntry 都在外面判
+  // `DSH_BRIDGE_FS_DENY_CREDENTIALS !== '0'`），所以项目里真有一个叫 `credentials` /
+  // `.env` / `auth.json` 的目录时，设 `DSH_BRIDGE_FS_DENY_CREDENTIALS=0` 即可恢复访问
+  // （启动会打强告警）——与第③层既有语义一致，不引入新的「不可解除」级别。
+  return p.split(sep).some((seg) => seg && PROTECTED_NAME_ANY.test(seg));
 }
 
 // ---------------------------------------------------------------------------
@@ -822,16 +852,34 @@ export function createLocalTools(deps = {}) {
         if (existed === null) statUncertain = true;
       }
       const dir = dirname(abs);
-      if (dir) fsImpl.mkdirSync(dir, { recursive: true });
+      const intendedBytes = Buffer.byteLength(args.content, 'utf8');
 
-      if (mode === 'append') fsImpl.appendFileSync(abs, args.content, 'utf8');
-      else fsImpl.writeFileSync(abs, args.content, 'utf8');
+      // 0.5.4：失败的写尝试**同样**必须留审计行。
+      // 此前 mkdirSync / writeFileSync / appendFileSync 抛错会直接冒泡，下面的 audit() 永远
+      // 不执行——实测注入 EACCES 后审计文件根本没被创建、logger 收到 0 行，一次失败的写
+      // 尝试不留任何痕迹。而「失败的写」恰恰是最该留痕的：它可能是权限边界被探测的信号，
+      // 也可能是攻击者尝试写敏感路径后被挡下的证据。审计只记**尝试**与**结果**，不记内容。
+      // 作用域说明：本项只覆盖 fs 层失败；guardPath 的策略拒绝（credential-protected 等）
+      // 是否留审计属另一条路径，见 CHANGELOG 0.5.4 的「未修/未验证」说明。
+      let writeError = null;
+      try {
+        if (dir) fsImpl.mkdirSync(dir, { recursive: true });
+        if (mode === 'append') fsImpl.appendFileSync(abs, args.content, 'utf8');
+        else fsImpl.writeFileSync(abs, args.content, 'utf8');
+      } catch (error) {
+        writeError = error;
+      }
+      if (writeError) {
+        // errorCode 走 auditField 转义：它是 fs 给的字符串，虽然可信度高于调用方输入，
+        // 但审计行的防注入纪律不该对字段来源做假设（0.5.2 的教训）。
+        audit(`AUDIT local_write_file path=${auditField(abs)} mode=${mode} existed=${existed} result=FAILED errorCode=${auditField(String(writeError?.code ?? writeError?.message ?? 'unknown'))} intendedBytes=${intendedBytes}`);
+        throw writeError;
+      }
 
       // 审计**前置于 statSync**（0.5.1）：0.5.0 把 statSync 放在审计行之前且不在 try 内，
       // 于是「写已落盘但 stat 抛错（EACCES / 并发删除 / EIO）」时审计行 0 条、回执退化成
       // internal-error——文件被改了却无痕，直接违反「每次写都留审计」这条声称的机械控制。
-      const intendedBytes = Buffer.byteLength(args.content, 'utf8');
-      audit(`AUDIT local_write_file path=${auditField(abs)} mode=${mode} existed=${existed} previousSize=${previousSize} writtenBytes=${intendedBytes}`);
+      audit(`AUDIT local_write_file path=${auditField(abs)} mode=${mode} existed=${existed} previousSize=${previousSize} writtenBytes=${intendedBytes} result=ok`);
 
       let st = null;
       try {
@@ -867,13 +915,20 @@ export function createLocalTools(deps = {}) {
       let truncated = false;
       let depthLimited = false;
       let skippedProtected = 0;
+      let skippedUnreadable = 0;
 
       const walk = (dir, depth) => {
         let names;
         try {
           names = fsImpl.readdirSync(dir, { withFileTypes: true });
         } catch {
-          return; // 无权限的子目录跳过，不让整次列举失败
+          // 无权限/不可读的子目录跳过，不让整次列举失败——但**必须计数**（0.5.4）。
+          // 0.5.3 及以前这里是静默 `return`：回执的 count / truncated / skippedProtected 全都
+          // 正常，调用方无从得知少了一整棵子树，于是把**不完整的树**读成完整。这与 0.5.0
+          // 「深度到顶静默停止下潜」是同一类缺陷（回执读起来像「列全了」）。
+          // grep 对同一棵树本来就有 `skipped.unreadable` 计数，两个工具的口径必须一致。
+          skippedUnreadable += 1;
+          return;
         }
         for (const ent of names) {
           if (entries.length >= maxEntries) { truncated = true; return; }
@@ -895,10 +950,25 @@ export function createLocalTools(deps = {}) {
         }
       };
       walk(abs, 0);
+      // 0.5.4：字段口径与 local_grep 对齐。grep 早就把两个语义分开——`truncated` 是广义
+      // 「结果不完整」（含跳过与超时），`limitTruncated` 才是狭义「被 limit 截断」。
+      // listDir 的 `truncated` 此前只有狭义，于是「有子目录读不了」时回执仍是
+      // truncated:false，被读成「列全了」——与 0.5.0 深度到顶静默停止是同一类缺陷。
+      const skippedTotal = skippedProtected + skippedUnreadable;
+      const limitTruncated = truncated;
+      const incomplete = limitTruncated || depthLimited || skippedTotal > 0;
       return {
-        ok: true, path: abs, recursive, count: entries.length, truncated,
-        depthLimited, skippedProtected,
-        ...(skippedProtected > 0 ? { note: `${skippedProtected} 个条目因凭据保护/黑名单被跳过，未列入` } : {}),
+        ok: true, path: abs, recursive, count: entries.length,
+        truncated: incomplete, limitTruncated,
+        depthLimited, skippedProtected, skippedUnreadable,
+        ...(incomplete ? {
+          note: [
+            limitTruncated ? `条目数达到 limit=${maxEntries}，已截断` : null,
+            depthLimited ? `递归深度达到上限 ${config.grepMaxDepth}，更深层未列举` : null,
+            skippedProtected > 0 ? `${skippedProtected} 个条目因凭据保护/黑名单被跳过` : null,
+            skippedUnreadable > 0 ? `${skippedUnreadable} 个目录不可读（权限/IO 错误），其子树未列举` : null,
+          ].filter(Boolean).join('；') + '——结果不完整',
+        } : {}),
         entries,
       };
     },
@@ -1382,8 +1452,12 @@ export function buildLocalTools(deps = {}) {
         description:
           '列目录（默认单层；recursive:true 递归，但跳过隐藏目录且有深度上限）。' +
           '参数：path（必填）；recursive（可选）；limit（可选，默认 500 条）。' +
-          '回执 entries[] 每项含 path/name/type（file|dir|symlink），truncated 表示被 limit 截断。' +
-          '无权限的子目录静默跳过，不让整次列举失败。',
+          '回执 entries[] 每项含 path/name/type（file|dir|symlink）。' +
+          '⚠️ truncated 表示**结果不完整**（口径与 local_grep 一致），可能因四种原因之一：' +
+          '条目数达 limit（另置 limitTruncated）、递归深度到顶（depthLimited）、' +
+          '条目被凭据保护/黑名单跳过（skippedProtected）、目录不可读（skippedUnreadable）。' +
+          '要区分「就是这么多」与「没列全」请看 note 与这四个计数，别只看 truncated。' +
+          '不可读的子目录会跳过（不让整次列举失败）但**计入 skippedUnreadable**，不再静默。',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1397,7 +1471,14 @@ export function buildLocalTools(deps = {}) {
           type: 'object',
           properties: {
             ok: { type: 'boolean' }, path: { type: 'string' }, recursive: { type: 'boolean' },
-            count: { type: 'number' }, truncated: { type: 'boolean' }, entries: { type: 'array' },
+            count: { type: 'number' },
+            truncated: { type: 'boolean', description: '结果不完整（任何原因）' },
+            limitTruncated: { type: 'boolean', description: '仅表示条目数被 limit 截断' },
+            depthLimited: { type: 'boolean' },
+            skippedProtected: { type: 'number' },
+            skippedUnreadable: { type: 'number', description: 'readdir 失败的目录数，其子树未列举' },
+            note: { type: 'string' },
+            entries: { type: 'array' },
           },
           required: ['ok', 'path', 'entries'],
         },
